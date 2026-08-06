@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -66,8 +67,16 @@ class AlertSink:
         self.echo = echo
         self.min_rank = SEVERITY_RANK[min_severity]
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Alert logs may contain sensitive host data — restrict access.
+        try:
+            os.chmod(self.log_path.parent, 0o700)
+        except OSError:
+            pass
 
     def emit(self, alert: Alert) -> None:
+        if not self.log_path.exists():
+            fd = os.open(str(self.log_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
         with self.log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(alert.to_dict(), ensure_ascii=False) + "\n")
         if self.echo and SEVERITY_RANK[alert.severity] >= self.min_rank:

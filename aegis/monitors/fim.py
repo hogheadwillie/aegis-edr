@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Dict, Iterator, List
 
@@ -56,6 +57,11 @@ def save_baseline(baseline: Dict[str, str], path: Path | str) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(baseline, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path.parent, 0o700)
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def load_baseline(path: Path | str) -> Dict[str, str]:

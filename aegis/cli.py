@@ -71,6 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_report = sub.add_parser("report", help="summarize the alert log")
     p_report.add_argument("--severity", choices=list(SEVERITY_RANK),
                           help="only show alerts at or above this severity")
+
+    p_serve = sub.add_parser("serve", help="run the web dashboard (localhost by default)")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8765)
+    p_serve.add_argument("--allow-remote", action="store_true",
+                         help="permit binding to non-loopback addresses (use with TLS + a proxy)")
     return parser
 
 
@@ -111,6 +117,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "report":
         return _cmd_report(args)
+
+    if args.command == "serve":
+        from .web.server import serve
+        serve(host=args.host, port=args.port, allow_remote=args.allow_remote,
+              rules_path=getattr(args, "rules", None))
+        return 0
 
     return 0
 

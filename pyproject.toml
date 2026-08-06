@@ -9,6 +9,9 @@ description = "Aegis EDR — host-based detection: process, network, and file-in
 requires-python = ">=3.9"
 dependencies = ["psutil>=5.9"]
 
+[project.optional-dependencies]
+web = ["fastapi>=0.110", "uvicorn>=0.29"]
+
 [project.scripts]
 aegis = "aegis.cli:main"
 
@@ -16,4 +19,4 @@ aegis = "aegis.cli:main"
 include = ["aegis*"]
 
 [tool.setuptools.package-data]
-aegis = ["rules/*.json"]
+aegis = ["rules/*.json", "web/static/*"]

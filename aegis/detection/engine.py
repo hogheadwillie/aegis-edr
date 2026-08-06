@@ -124,15 +124,23 @@ class DetectionEngine:
         return out
 
 
+MAX_RULE_FILE_BYTES = 5 * 1024 * 1024   # refuse absurdly large rule files
+MAX_RULES = 10_000
+
+
 def load_rules(path: Path | str) -> List[Rule]:
     """Load rules from a JSON file or a directory of JSON files."""
     path = Path(path)
     files = sorted(path.glob("*.json")) if path.is_dir() else [path]
     rules: List[Rule] = []
     for f in files:
+        if f.stat().st_size > MAX_RULE_FILE_BYTES:
+            raise ValueError(f"rule file {f} exceeds {MAX_RULE_FILE_BYTES} bytes")
         data = json.loads(f.read_text(encoding="utf-8"))
         items = data if isinstance(data, list) else [data]
         rules.extend(Rule.from_dict(item) for item in items)
+    if len(rules) > MAX_RULES:
+        raise ValueError(f"too many rules ({len(rules)} > {MAX_RULES})")
     return rules
 
 
