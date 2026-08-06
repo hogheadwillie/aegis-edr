@@ -1,0 +1,145 @@
+[
+  {
+    "id": "PROC-001",
+    "name": "Execution from temporary directory",
+    "severity": "high",
+    "event_type": "process",
+    "description": "A process is running an executable from a world-writable temp location, a common malware staging and defense-evasion pattern.",
+    "mitre": ["T1059", "T1070"],
+    "conditions": [
+      {"field": "exe_dir", "op": "in", "value": ["/tmp", "/var/tmp", "/dev/shm", "C:\\Windows\\Temp", "C:\\Users\\Public"]}
+    ]
+  },
+  {
+    "id": "PROC-002",
+    "name": "Fileless or deleted-binary execution",
+    "severity": "critical",
+    "event_type": "process",
+    "description": "The process executable was deleted after launch (memfd/self-deleting dropper), indicating in-memory payload execution.",
+    "mitre": ["T1055", "T1620"],
+    "conditions": [
+      {"field": "exe_deleted", "op": "eq", "value": true}
+    ]
+  },
+  {
+    "id": "PROC-003",
+    "name": "Obfuscated or encoded command line",
+    "severity": "high",
+    "event_type": "process",
+    "description": "Command line contains encoded-content flags or base64 decode pipelines typical of obfuscated payloads.",
+    "mitre": ["T1027", "T1140"],
+    "logic": "any",
+    "conditions": [
+      {"field": "cmdline", "op": "regex", "value": "(-enc|-encodedcommand|-e\\s+[A-Za-z0-9+/=]{40,})"},
+      {"field": "cmdline", "op": "regex", "value": "base64\\s+(-d|--decode)"},
+      {"field": "cmdline", "op": "contains_any", "value": ["frombase64string", "b64decode", "certutil -decode"]}
+    ]
+  },
+  {
+    "id": "PROC-004",
+    "name": "Credential store access attempt",
+    "severity": "high",
+    "event_type": "process",
+    "description": "Command line references OS credential stores, consistent with credential dumping.",
+    "mitre": ["T1003", "T1552"],
+    "logic": "any",
+    "conditions": [
+      {"field": "cmdline", "op": "contains_any", "value": ["/etc/shadow", "/etc/sudoers", "sam\\system", "sekurlsa", "lsass"]}
+    ]
+  },
+  {
+    "id": "PROC-005",
+    "name": "Suspicious download cradle",
+    "severity": "medium",
+    "event_type": "process",
+    "description": "A download-and-execute pattern (curl/wget piped to an interpreter) is present in the command line.",
+    "mitre": ["T1105", "T1059"],
+    "conditions": [
+      {"field": "cmdline", "op": "regex", "value": "(curl|wget|Invoke-WebRequest|iwr)\\s+.*\\|\\s*(sh|bash|python|perl|php|powershell)"}
+    ]
+  },
+  {
+    "id": "NET-001",
+    "name": "Connection to known-malicious IP",
+    "severity": "critical",
+    "event_type": "network",
+    "description": "An established connection to an IP on the IOC feed was observed.",
+    "mitre": ["T1071"],
+    "conditions": [
+      {"field": "remote_ip", "op": "in_ioc", "value": "ip"}
+    ]
+  },
+  {
+    "id": "NET-002",
+    "name": "Connection on classic C2 port",
+    "severity": "medium",
+    "event_type": "network",
+    "description": "Outbound connection to a port frequently associated with commodity C2 frameworks and backdoors.",
+    "mitre": ["T1071", "T1571"],
+    "conditions": [
+      {"field": "remote_port", "op": "in", "value": [1337, 4444, 5555, 6660, 6666, 6667, 6668, 6669, 31337]}
+    ]
+  },
+  {
+    "id": "NET-003",
+    "name": "Possible reverse shell",
+    "severity": "high",
+    "event_type": "network",
+    "description": "A shell or scripting interpreter holds an established outbound connection to a non-standard port.",
+    "mitre": ["T1059", "T1071"],
+    "conditions": [
+      {"field": "direction", "op": "eq", "value": "outbound"},
+      {"field": "is_shell", "op": "eq", "value": true},
+      {"field": "remote_port", "op": "in", "value": [1337, 2222, 4444, 5555, 8081, 8443, 9001, 31337]}
+    ]
+  },
+  {
+    "id": "NET-004",
+    "name": "Shell listening on network port",
+    "severity": "critical",
+    "event_type": "network",
+    "description": "A shell-like process is listening for inbound connections, consistent with a bind shell backdoor.",
+    "mitre": ["T1059", "T1571"],
+    "conditions": [
+      {"field": "direction", "op": "eq", "value": "listen"},
+      {"field": "is_shell", "op": "eq", "value": true}
+    ]
+  },
+  {
+    "id": "FIM-001",
+    "name": "Sensitive account or auth file changed",
+    "severity": "critical",
+    "event_type": "file_change",
+    "description": "An account, authentication, or privilege file was created or modified — potential persistence or account manipulation.",
+    "mitre": ["T1098", "T1136", "T1556"],
+    "logic": "any",
+    "conditions": [
+      {"field": "path", "op": "regex", "value": "(/etc/(passwd|shadow|sudoers)|authorized_keys|/\\.ssh/)"},
+      {"field": "path", "op": "regex", "value": "(crontab|/cron\\.)"}
+    ]
+  },
+  {
+    "id": "FIM-002",
+    "name": "New content in startup or persistence location",
+    "severity": "high",
+    "event_type": "file_change",
+    "description": "A file was created in an autostart or persistence directory.",
+    "mitre": ["T1547", "T1053"],
+    "conditions": [
+      {"field": "change", "op": "eq", "value": "created"},
+      {"field": "path", "op": "regex", "value": "(systemd/system|/etc/init\\.d|\\.config/autostart|Startup|LaunchAgents|LaunchDaemons)"}
+    ]
+  },
+  {
+    "id": "FIM-003",
+    "name": "Executable written to temp directory",
+    "severity": "medium",
+    "event_type": "file_change",
+    "description": "A new file appeared under a temp directory — common staging behavior.",
+    "mitre": ["T1070", "T1059"],
+    "conditions": [
+      {"field": "change", "op": "eq", "value": "created"},
+      {"field": "path", "op": "startswith", "value": "/tmp/"}
+    ]
+  }
+]

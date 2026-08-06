@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aegis-edr"
+version = "1.0.0"
+description = "Aegis EDR — host-based detection: process, network, and file-integrity monitoring"
+requires-python = ">=3.9"
+dependencies = ["psutil>=5.9"]
+
+[project.scripts]
+aegis = "aegis.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["aegis*"]
+
+[tool.setuptools.package-data]
+aegis = ["rules/*.json"]
