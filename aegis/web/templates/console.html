@@ -11,6 +11,7 @@
     <div class="brand">AEGIS <span>EDR</span></div>
     <div class="topbar-right">
       <span class="muted">host: {{ stats.host }}</span>
+      {% if user %}<span class="muted">{{ user.username }} ({{ user.role }})</span>{% endif %}
       <form method="post" action="/ui/scan" class="inline-form">
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <button type="submit" class="primary">Run scan</button>
@@ -96,7 +97,6 @@
                  pattern="[\w.\-:]+">
           <button type="submit" class="primary">Add</button>
         </form>
-        {% if ioc_error %}<p class="error">{{ ioc_error }}</p>{% endif %}
         {% for category, values in iocs.items() %}
           {% if values %}
           <div class="ioc-cat">
@@ -116,6 +116,65 @@
         {% endfor %}
       </section>
     </div>
+
+    {% if user and user.role == "admin" %}
+    <div class="grid-2">
+      <section class="panel">
+        <div class="panel-head"><h2>Users</h2></div>
+        <form method="post" action="/ui/users/add" class="ioc-form" autocomplete="off">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input name="username" type="text" placeholder="username" required
+                 minlength="3" maxlength="32" pattern="[a-zA-Z0-9_.\-]+">
+          <input name="password" type="password" placeholder="password (min 12 chars)"
+                 required minlength="12">
+          <select name="role">
+            <option value="analyst">analyst</option>
+            <option value="admin">admin</option>
+          </select>
+          <button type="submit" class="primary">Add</button>
+        </form>
+        <table>
+          <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>
+          <tbody>
+            {% for u in users %}
+            <tr>
+              <td>{{ u.username }}</td>
+              <td><span class="badge badge-{{ 'high' if u.role == 'admin' else 'low' }}">{{ u.role }}</span></td>
+              <td>
+                {% if not (u.role == "admin" and admin_count == 1) %}
+                <form method="post" action="/ui/users/remove" class="inline-form">
+                  <input type="hidden" name="csrf" value="{{ csrf }}">
+                  <input type="hidden" name="username" value="{{ u.username }}">
+                  <button type="submit" title="remove user" class="danger-link">remove</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Audit log</h2></div>
+        <table>
+          <thead><tr><th>Time (UTC)</th><th>User</th><th>Action</th><th>Detail</th></tr></thead>
+          <tbody>
+            {% for ev in audit %}
+            <tr>
+              <td>{{ ev.ts }}</td>
+              <td>{{ ev.user }}</td>
+              <td>{{ ev.action }}</td>
+              <td>{{ ev.detail }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="muted">No audit events yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+    </div>
+    {% endif %}
   </main>
 </body>
 </html>

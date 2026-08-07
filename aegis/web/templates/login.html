@@ -10,9 +10,17 @@
   <div class="login-wrap">
     <form class="login-card" method="post" action="/login" autocomplete="off">
       <div class="brand">AEGIS <span>EDR</span></div>
-      <p class="muted">Paste your API token (found in <code>~/.aegis/api_token</code>).</p>
+      {% if mode == "users" %}
+      <p class="muted">Sign in with your account.</p>
+      <input name="username" type="text" placeholder="Username" required
+             minlength="3" maxlength="32" autofocus>
+      <input name="password" type="password" placeholder="Password" required>
+      {% else %}
+      <p class="muted">Paste your API token (found in <code>~/.aegis/api_token</code>),
+        or run <code>aegis user add</code> to enable multi-user accounts.</p>
       <input name="token" type="password" placeholder="API token" required minlength="32"
              autofocus>
+      {% endif %}
       <button type="submit">Authenticate</button>
       {% if error %}
       <p class="error">{{ error }}</p>

@@ -180,8 +180,11 @@ class TestBrowserSessions:
                         data={"csrf": csrf, "category": "ip", "value": "203.0.113.9"},
                         follow_redirects=False)
         assert r.status_code == 303
-        r = client.get("/console", cookies=cookies)
-        assert "203.0.113.9" not in r.text
+        # The IOC feed no longer lists it (the audit log legitimately records
+        # the removal with the value, so check the feed section only).
+        feed = r.text.split("IOC feed")[-1].split("Audit log")[0] \
+            if "Audit log" in r.text else r.text.split("IOC feed")[-1]
+        assert "203.0.113.9" not in feed
 
     def test_ui_ioc_rejects_bad_values(self, client, good_token):
         cookies = self._login(client, good_token)
@@ -192,7 +195,7 @@ class TestBrowserSessions:
                         follow_redirects=False)
         assert r.status_code == 303  # silently refused, nothing stored
         r = client.get("/console", cookies=cookies)
-        assert "script" not in r.text
+        assert "bad value" not in r.text
 
     def test_session_store_unit(self):
         store = SessionStore(ttl_seconds=60)

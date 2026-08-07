@@ -33,6 +33,8 @@ from ..agent import Agent, hostname
 from ..alerts import SEVERITY_RANK, AlertSink, load_alerts
 from ..detection.engine import DetectionEngine, load_iocs, load_rules
 from ..monitors import fim as fim_mod
+from .audit import log_event, load_events
+from .auth import UserStore
 from .security import (AuthLockout, RateLimiter, SecurityHeadersMiddleware,
                        check_token, load_or_create_token)
 from .sessions import SESSION_COOKIE, SessionStore
@@ -75,6 +77,8 @@ def create_app(token_path: Path | str | None = None,
     limiter = RateLimiter(max_requests=120, window_seconds=60.0)
     lockout = AuthLockout(max_failures=5, lockout_seconds=300.0)
     sessions = SessionStore()
+    users = UserStore(AEGIS_HOME / "users.json")
+    audit_path = AEGIS_HOME / "audit.jsonl"
 
     def _client_ip(request: Request) -> str:
         return request.client.host if request.client else "unknown"
@@ -152,18 +156,37 @@ def create_app(token_path: Path | str | None = None,
         _throttle(request)
         if _session(request) is not None:
             return RedirectResponse("/console", status_code=status.HTTP_303_SEE_OTHER)
-        return templates.TemplateResponse(request, "login.html", {"error": None})
+        mode = "users" if users.count() > 0 else "token"
+        return templates.TemplateResponse(request, "login.html",
+                                          {"error": None, "mode": mode})
 
     @app.post("/login", response_class=HTMLResponse, include_in_schema=False)
-    def login(request: Request, token: str = Form(min_length=1, max_length=256)) -> Response:
+    def login(request: Request,
+              username: str = Form(default="", max_length=64),
+              password: str = Form(default="", max_length=256),
+              token: str = Form(default="", max_length=256)) -> Response:
         ip = _throttle(request)
-        if not check_token(token, load_or_create_token()):
+        mode = "users" if users.count() > 0 else "token"
+
+        def deny(msg: str) -> Response:
             lockout.record_failure(ip)
+            log_event(audit_path, username or "(token)", "login_failed", msg)
             return templates.TemplateResponse(
-                request, "login.html", {"error": "Invalid token — access denied."},
+                request, "login.html", {"error": msg, "mode": mode},
                 status_code=status.HTTP_401_UNAUTHORIZED)
+
+        if mode == "users":
+            user = users.verify(username.strip(), password) if username and password else None
+            if user is None:
+                return deny("Invalid username or password.")
+            sid, _csrf = sessions.create(username=user.username, role=user.role)
+            log_event(audit_path, user.username, "login", "")
+        else:
+            if not token or not check_token(token, load_or_create_token()):
+                return deny("Invalid token — access denied.")
+            sid, _csrf = sessions.create(username="(token)", role="admin")
+
         lockout.record_success(ip)
-        sid, _csrf = sessions.create()
         response = RedirectResponse("/console", status_code=status.HTTP_303_SEE_OTHER)
         response.set_cookie(SESSION_COOKIE, sid, max_age=int(sessions.ttl),
                             httponly=True, samesite="strict", secure=secure_cookies)
@@ -198,10 +221,16 @@ def create_app(token_path: Path | str | None = None,
                      for r in rules]
         iocs = {k: sorted(v) for k, v in load_iocs(AEGIS_HOME / "iocs.json").items()}
 
+        user = {"username": session.get("username", ""), "role": session.get("role", "")}
+        user_rows = users.list_users()
+        admin_count = sum(1 for u in user_rows if u.role == "admin")
+        audit_rows = load_events(audit_path, limit=100) if user["role"] == "admin" else []
+
         return templates.TemplateResponse(request, "console.html", {
             "stats": _stats(), "alerts": alert_rows, "rules": rule_rows, "iocs": iocs,
             "severity": severity, "notice": notice, "ioc_error": ioc_error,
-            "csrf": session["csrf"],
+            "csrf": session["csrf"], "user": user, "users": [u.to_dict() for u in user_rows],
+            "admin_count": admin_count, "audit": audit_rows,
         })
 
     @app.post("/ui/scan", include_in_schema=False)
@@ -228,11 +257,44 @@ def create_app(token_path: Path | str | None = None,
     def ui_iocs_remove(request: Request, csrf: str = Form(default=""),
                        category: str = Form(default=""),
                        value: str = Form(default="")) -> RedirectResponse:
-        _require_csrf(request, csrf)
+        session = _require_csrf(request, csrf)
         if category in ("ip", "domain", "sha256"):
             iocs = load_iocs(AEGIS_HOME / "iocs.json")
             iocs.setdefault(category, set()).discard(value)
             _write_iocs(iocs)
+            log_event(audit_path, session.get("username", "?"), "ioc_remove", value[:120])
+        return _redirect_console()
+
+    # -- user administration (admin only) -------------------------------------
+
+    def _require_admin(request: Request, csrf: str) -> dict:
+        session = _require_csrf(request, csrf)
+        if session.get("role") != "admin":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "admin role required")
+        return session
+
+    @app.post("/ui/users/add", include_in_schema=False)
+    def ui_users_add(request: Request, csrf: str = Form(default=""),
+                     username: str = Form(default="", max_length=32),
+                     password: str = Form(default="", max_length=256),
+                     role: str = Form(default="")) -> RedirectResponse:
+        session = _require_admin(request, csrf)
+        try:
+            users.add_user(username, password, role)
+            log_event(audit_path, session.get("username", "?"), "user_add", username.strip())
+        except ValueError:
+            pass  # invalid input or duplicate — silently refused
+        return _redirect_console()
+
+    @app.post("/ui/users/remove", include_in_schema=False)
+    def ui_users_remove(request: Request, csrf: str = Form(default=""),
+                        username: str = Form(default="", max_length=32)) -> RedirectResponse:
+        session = _require_admin(request, csrf)
+        try:
+            users.remove_user(username.strip())
+            log_event(audit_path, session.get("username", "?"), "user_remove", username.strip())
+        except ValueError:
+            pass  # unknown user or last admin — refused
         return _redirect_console()
 
     # ======================================================================

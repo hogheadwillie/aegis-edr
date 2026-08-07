@@ -38,6 +38,8 @@ code { color: var(--accent); }
 }
 .inline-form { display: inline; }
 .inline-form button { border: none; padding: 0 4px; }
+.danger-link { color: var(--critical); }
+.danger-link:hover { color: var(--critical); text-decoration: underline; }
 
 /* Login */
 .login-wrap {
