@@ -79,6 +79,18 @@ def build_parser() -> argparse.ArgumentParser:
                          help="permit binding to non-loopback addresses (use with TLS + a proxy)")
     p_serve.add_argument("--secure-cookies", action="store_true",
                          help="mark session cookies Secure (set when serving over HTTPS)")
+
+    p_user = sub.add_parser("user", help="manage dashboard accounts (Argon2id-hashed)")
+    user_sub = p_user.add_subparsers(dest="user_command", required=True)
+    p_uadd = user_sub.add_parser("add", help="create an account")
+    p_uadd.add_argument("username")
+    p_uadd.add_argument("--role", choices=["admin", "analyst"], default="analyst")
+    p_uadd.add_argument("--password", help="omit to generate a random one")
+    p_udel = user_sub.add_parser("remove", help="delete an account")
+    p_udel.add_argument("username")
+    p_upw = user_sub.add_parser("passwd", help="change a password")
+    p_upw.add_argument("username")
+    user_sub.add_parser("list", help="show accounts")
     return parser
 
 
@@ -127,7 +139,43 @@ def main(argv: Optional[List[str]] = None) -> int:
               secure_cookies=args.secure_cookies)
         return 0
 
+    if args.command == "user":
+        return _cmd_user(args)
+
     return 0
+
+
+def _cmd_user(args) -> int:
+    from .web.auth import UserStore, generate_password
+
+    store = UserStore(AEGIS_HOME / "users.json")
+    try:
+        if args.user_command == "add":
+            password = args.password or generate_password()
+            store.add_user(args.username, password, args.role)
+            print(f"Created {args.role} account: {args.username}")
+            if not args.password:
+                print(f"Generated password: {password}")
+                print("(store it now — it is Argon2id-hashed and cannot be recovered)")
+        elif args.user_command == "remove":
+            store.remove_user(args.username)
+            print(f"Removed account: {args.username}")
+        elif args.user_command == "passwd":
+            import getpass
+            password = getpass.getpass("New password (min 12 chars): ")
+            store.change_password(args.username, password)
+            print(f"Password updated for: {args.username}")
+        elif args.user_command == "list":
+            users = store.list_users()
+            if not users:
+                print("No accounts — the console is in single-token mode. "
+                      "Run 'aegis user add <name> --role admin' to switch to multi-user.")
+            for u in users:
+                print(f"  {u.username:20} {u.role}")
+        return 0
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 def _cmd_ioc(args) -> int:

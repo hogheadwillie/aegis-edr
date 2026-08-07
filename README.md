@@ -72,7 +72,6 @@ python -m aegis report --severity high
 # web console + REST API (localhost only, server-rendered, no JavaScript)
 pip install ".[web]"
 python -m aegis serve                    # http://127.0.0.1:8765
-cat ~/.aegis/api_token                   # paste into the login page
 python -m aegis serve --secure-cookies   # when serving over HTTPS
 ```
 
@@ -107,8 +106,39 @@ Operators: `eq`, `ne`, `gt`, `lt`, `in`, `contains`, `contains_any`, `startswith
 
 ```bash
 pip install pytest httpx
-python -m pytest tests/ -v   # 40 tests (core + web security)
+python -m pytest tests/ -v   # 57 tests (core + web security + multi-user auth)
 ```
+
+## Managing accounts
+
+```bash
+python -m aegis user add alice --role admin           # generates a strong password
+python -m aegis user add bob --role analyst --password '...'
+python -m aegis user passwd alice                     # interactive change
+python -m aegis user list
+python -m aegis user remove bob                       # last admin is protected
+```
+
+## Deploying behind nginx (TLS termination)
+
+For remote access, put the app behind nginx which owns HTTPS and forwards to
+the loopback-bound app — configs included:
+
+```bash
+sudo deploy/nginx/gen-dev-cert.sh                 # self-signed lab cert
+sudo cp deploy/nginx/aegis.conf /etc/nginx/sites-available/aegis
+sudo ln -s /etc/nginx/sites-available/aegis /etc/nginx/sites-enabled/
+python -m aegis user add admin1 --role admin      # create your accounts
+python -m aegis serve --secure-cookies            # app stays on 127.0.0.1:8765
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+The config enforces TLS 1.2/1.3 only, HSTS, edge rate limiting on `/login`
+and `/api/*`, 1 MB body cap, and HTTP→HTTPS redirect. Production: swap the dev
+cert for Let's Encrypt (`certbot --nginx -d your.host`). For post-quantum key
+exchange, OpenSSL 3.5 / nginx builds with ML-KEM (X25519MLKEM768) hybrid
+groups make the TLS layer itself quantum-resistant — that lives at the proxy,
+not the app.
 
 ## Web console & API security — pure Python, zero JavaScript
 
@@ -117,8 +147,11 @@ line of executable code in this project is Python**. The dashboard is Jinja2
 HTML rendered by FastAPI — there is no JavaScript anywhere in the stack.
 
 **Browser UI (server-rendered)**
-- Login exchanges the token for a server-side session; the browser only holds an opaque session cookie — `HttpOnly`, `SameSite=Strict`, 12 h expiry, `Secure` with `--secure-cookies`
-- Per-session CSRF tokens required on every form POST (scan, IOC add/remove), verified before any input handling
+- **Multi-user accounts** with quantum-resistant password hashing: Argon2id (RFC 9106, OWASP parameters — 64 MiB, 3 iterations). Argon2id's security is unaffected by Shor's algorithm and Grover's only halves symmetric strength, so brute force stays infeasible for classical *and* quantum adversaries. Only hashes are ever stored (0600 file).
+- Roles: `admin` (manage users, view audit log) and `analyst` (console only). Single-token mode remains until the first account is created (`aegis user add <name> --role admin`); the last admin cannot be removed.
+- Audit trail: logins, failed logins, user/IOC changes appended to `~/.aegis/audit.jsonl` (0600).
+- The browser only holds an opaque session cookie — `HttpOnly`, `SameSite=Strict`, 12 h expiry, `Secure` with `--secure-cookies`
+- Per-session CSRF tokens required on every form POST (scan, IOC add/remove, user admin), verified before any input handling
 - Jinja2 autoescaping makes all rendered alert/rule/IOC data XSS-safe by default
 - Post/Redirect/Get pattern throughout — no resubmission pitfalls
 
@@ -130,10 +163,10 @@ HTML rendered by FastAPI — there is no JavaScript anywhere in the stack.
 - Per-IP sliding-window rate limiting (120 req/min) and brute-force lockout (5 failures → 5 min) on both surfaces
 - Security headers on every response: strict CSP (`script-src 'self'`, `frame-ancestors 'none'`), `nosniff`, `DENY` framing, `no-store`, `Server` header stripped
 - No CORS (same-origin only), no `docs`/`openapi.json` exposed, validated inputs, path-traversal guards on static files and FIM directories
-- Binds to `127.0.0.1` by default; refuses non-loopback binds without `--allow-remote` (put it behind a TLS-terminating proxy for remote use)
+- Binds to `127.0.0.1` by default; refuses non-loopback binds without `--allow-remote`
 
 **Core hardening (applies to the CLI too)**
-- Alert log, IOC store, FIM baselines, and API token are written `0600` inside `0700` directories
+- Alert log, IOC store, FIM baselines, users file, and API token are written `0600` inside `0700` directories
 - Rule files: 5 MB size cap, 10k rule cap, strict schema validation
 
 ### API endpoints
@@ -155,7 +188,7 @@ aegis/
 ├── aegis/
 │   ├── agent.py              # orchestration, watch loop, dedup
 │   ├── alerts.py             # alert model, JSONL sink, reporting loader
-│   ├── cli.py                # scan / watch / fim / ioc / report / serve
+│   ├── cli.py                # scan / watch / fim / ioc / report / serve / user
 │   ├── detection/engine.py   # rule matching + IOC store
 │   ├── monitors/
 │   │   ├── process.py        # process enumeration (incl. deleted-binary check)
@@ -163,13 +196,17 @@ aegis/
 │   │   └── fim.py            # SHA-256 baselines and diffing
 │   ├── rules/default_rules.json
 │   └── web/
+│       ├── auth.py           # Argon2id multi-user accounts + roles
+│       ├── audit.py          # audit trail (logins, user/IOC changes)
 │       ├── security.py       # token mgmt, rate limiter, lockout, headers
 │       ├── sessions.py       # server-side sessions + CSRF tokens
 │       ├── server.py         # FastAPI: server-rendered UI + JSON API
 │       ├── templates/        # login.html, console.html (Jinja2)
 │       └── static/style.css  # the only non-Python asset (styling, not code)
+├── deploy/nginx/             # TLS-terminating reverse proxy config + dev cert script
 ├── tests/test_aegis.py
 ├── tests/test_web.py
+├── tests/test_users.py
 └── pyproject.toml
 ```
 

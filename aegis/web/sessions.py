@@ -25,15 +25,16 @@ class SessionStore:
         self._sessions: Dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    def create(self) -> Tuple[str, str]:
-        """Return (session_id, csrf_token)."""
+    def create(self, username: str = "", role: str = "") -> Tuple[str, str]:
+        """Return (session_id, csrf_token), bound to a user identity."""
         sid = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
         with self._lock:
             self._sweep_locked()
             if len(self._sessions) >= self.max_sessions:
                 raise RuntimeError("too many active sessions")
-            self._sessions[sid] = {"expires": time.monotonic() + self.ttl, "csrf": csrf}
+            self._sessions[sid] = {"expires": time.monotonic() + self.ttl,
+                                   "csrf": csrf, "username": username, "role": role}
         return sid, csrf
 
     def validate(self, sid: Optional[str]) -> Optional[dict]:
