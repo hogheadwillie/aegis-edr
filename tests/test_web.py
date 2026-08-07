@@ -1,6 +1,7 @@
-"""Tests for the Aegis web layer: auth, rate limiting, headers, validation."""
+"""Tests for the Aegis web layer: auth, sessions, CSRF, rate limiting, headers."""
 
 import os
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 from aegis.web.security import (AuthLockout, RateLimiter, SecurityHeadersMiddleware,
                                 check_token, load_or_create_token)
 from aegis.web.server import create_app
+from aegis.web.sessions import SessionStore
 
 
 @pytest.fixture()
@@ -21,6 +23,14 @@ def client(token_path, tmp_path, monkeypatch):
     monkeypatch.setattr("aegis.web.server.AEGIS_HOME", tmp_path / "aegis_home")
     app = create_app(token_path=token_path)
     return TestClient(app)
+
+
+@pytest.fixture()
+def good_token(token_path, monkeypatch):
+    """Pin the token the app compares against (mirrors the on-disk file)."""
+    token = _token(token_path)
+    monkeypatch.setattr("aegis.web.server.load_or_create_token", lambda *a, **k: token)
+    return token
 
 
 def _token(token_path):
@@ -100,6 +110,102 @@ class TestSecurityHeaders:
     def test_no_api_schema_exposed(self, client):
         assert client.get("/openapi.json").status_code == 404
         assert client.get("/docs").status_code == 404
+
+
+class TestBrowserSessions:
+    def _login(self, client, good_token):
+        r = client.post("/login", data={"token": good_token},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        cookie = r.headers["set-cookie"]
+        assert "httponly" in cookie.lower()
+        assert "samesite=strict" in cookie.lower()
+        # TestClient doesn't persist response cookies automatically; set them
+        # on the client instance so they survive redirects across requests.
+        client.cookies.update(r.cookies)
+        return client.cookies
+
+    def _csrf(self, client, cookies):
+        r = client.get("/console", cookies=cookies)
+        assert r.status_code == 200
+        m = re.search(r'name="csrf" value="([^"]+)"', r.text)
+        assert m, "console page must embed a CSRF token"
+        return m.group(1)
+
+    def test_login_page_served(self, client):
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "API token" in r.text
+
+    def test_console_requires_session(self, client):
+        r = client.get("/console", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+
+    def test_wrong_token_login_rejected(self, client):
+        r = client.post("/login", data={"token": "wrong" * 10})
+        assert r.status_code == 401
+        assert "Invalid token" in r.text
+
+    def test_full_login_console_logout_flow(self, client, good_token):
+        cookies = self._login(client, good_token)
+        r = client.get("/console", cookies=cookies)
+        assert r.status_code == 200
+        assert "Detection rules" in r.text
+        assert "IOC feed" in r.text
+        # logout destroys the session server-side
+        r = client.post("/logout", cookies=cookies, follow_redirects=False)
+        assert r.status_code == 303
+        r = client.get("/console", cookies=cookies, follow_redirects=False)
+        assert r.status_code == 303
+
+    def test_csrf_required_on_ui_posts(self, client, good_token):
+        cookies = self._login(client, good_token)
+        r = client.post("/ui/scan", cookies=cookies, data={"csrf": "bogus"})
+        assert r.status_code == 403
+        r = client.post("/ui/iocs/add", cookies=cookies,
+                        data={"category": "ip", "value": "203.0.113.9"})
+        assert r.status_code == 403  # missing csrf field entirely
+
+    def test_ui_ioc_add_and_remove(self, client, good_token):
+        cookies = self._login(client, good_token)
+        csrf = self._csrf(client, cookies)
+        r = client.post("/ui/iocs/add", cookies=cookies,
+                        data={"csrf": csrf, "category": "ip", "value": "203.0.113.9"},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        r = client.get("/console", cookies=cookies)
+        assert "203.0.113.9" in r.text
+        r = client.post("/ui/iocs/remove", cookies=cookies,
+                        data={"csrf": csrf, "category": "ip", "value": "203.0.113.9"},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        r = client.get("/console", cookies=cookies)
+        assert "203.0.113.9" not in r.text
+
+    def test_ui_ioc_rejects_bad_values(self, client, good_token):
+        cookies = self._login(client, good_token)
+        csrf = self._csrf(client, cookies)
+        r = client.post("/ui/iocs/add", cookies=cookies,
+                        data={"csrf": csrf, "category": "ip",
+                              "value": "bad value <script>"},
+                        follow_redirects=False)
+        assert r.status_code == 303  # silently refused, nothing stored
+        r = client.get("/console", cookies=cookies)
+        assert "script" not in r.text
+
+    def test_session_store_unit(self):
+        store = SessionStore(ttl_seconds=60)
+        sid, csrf = store.create()
+        assert store.validate(sid) is not None
+        assert store.check_csrf(sid, csrf)
+        assert not store.check_csrf(sid, "nope")
+        store.destroy(sid)
+        assert store.validate(sid) is None
+        # expired sessions are rejected
+        store2 = SessionStore(ttl_seconds=-1)
+        sid2, _ = store2.create()
+        assert store2.validate(sid2) is None
 
 
 class TestEndpoints:

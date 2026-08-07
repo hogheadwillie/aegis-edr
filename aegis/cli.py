@@ -77,6 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--port", type=int, default=8765)
     p_serve.add_argument("--allow-remote", action="store_true",
                          help="permit binding to non-loopback addresses (use with TLS + a proxy)")
+    p_serve.add_argument("--secure-cookies", action="store_true",
+                         help="mark session cookies Secure (set when serving over HTTPS)")
     return parser
 
 
@@ -121,7 +123,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "serve":
         from .web.server import serve
         serve(host=args.host, port=args.port, allow_remote=args.allow_remote,
-              rules_path=getattr(args, "rules", None))
+              rules_path=getattr(args, "rules", None),
+              secure_cookies=args.secure_cookies)
         return 0
 
     return 0

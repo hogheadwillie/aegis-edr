@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aegis EDR — Console</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">AEGIS <span>EDR</span></div>
+    <div class="topbar-right">
+      <span class="muted">host: {{ stats.host }}</span>
+      <form method="post" action="/ui/scan" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit" class="primary">Run scan</button>
+      </form>
+      <form method="post" action="/logout" class="inline-form">
+        <button type="submit">Log out</button>
+      </form>
+    </div>
+  </header>
+
+  <main>
+    {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+
+    <section class="cards">
+      <div class="card"><div class="card-num">{{ stats.total_alerts }}</div><div class="card-label">Total alerts</div></div>
+      <div class="card sev-critical"><div class="card-num">{{ stats.by_severity.critical }}</div><div class="card-label">Critical</div></div>
+      <div class="card sev-high"><div class="card-num">{{ stats.by_severity.high }}</div><div class="card-label">High</div></div>
+      <div class="card sev-medium"><div class="card-num">{{ stats.by_severity.medium }}</div><div class="card-label">Medium</div></div>
+      <div class="card sev-low"><div class="card-num">{{ stats.by_severity.low }}</div><div class="card-label">Low</div></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Alerts</h2>
+        <form method="get" action="/console" class="inline-form">
+          <select name="severity" onchange="this.form.submit()">
+            <option value=""{{ ' selected' if not severity }}>All severities</option>
+            {% for sev in ["critical", "high", "medium", "low"] %}
+            <option value="{{ sev }}"{{ ' selected' if severity == sev }}>{{ sev }}+</option>
+            {% endfor %}
+          </select>
+        </form>
+      </div>
+      <table>
+        <thead><tr><th>Time (UTC)</th><th>Severity</th><th>Rule</th><th>Detection</th><th>Subject</th><th>MITRE</th></tr></thead>
+        <tbody>
+          {% for alert in alerts %}
+          <tr>
+            <td>{{ alert.timestamp }}</td>
+            <td><span class="badge badge-{{ alert.severity }}">{{ alert.severity }}</span></td>
+            <td>{{ alert.rule_id }}</td>
+            <td>{{ alert.name }}</td>
+            <td>{{ alert.subject }}</td>
+            <td>
+              {% for tid in alert.mitre %}<span class="mitre-tag">{{ tid }}</span>{% endfor %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="muted">No alerts recorded yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <div class="grid-2">
+      <section class="panel">
+        <div class="panel-head"><h2>Detection rules</h2></div>
+        <table>
+          <thead><tr><th>ID</th><th>Name</th><th>Severity</th><th>ATT&amp;CK</th></tr></thead>
+          <tbody>
+            {% for rule in rules %}
+            <tr>
+              <td>{{ rule.id }}</td>
+              <td>{{ rule.name }}</td>
+              <td><span class="badge badge-{{ rule.severity }}">{{ rule.severity }}</span></td>
+              <td>{% for tid in rule.mitre %}<span class="mitre-tag">{{ tid }}</span>{% endfor %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>IOC feed</h2></div>
+        <form method="post" action="/ui/iocs/add" class="ioc-form" autocomplete="off">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <select name="category">
+            <option value="ip">IP</option>
+            <option value="domain">Domain</option>
+            <option value="sha256">SHA-256</option>
+          </select>
+          <input name="value" type="text" placeholder="indicator value" required maxlength="256"
+                 pattern="[\w.\-:]+">
+          <button type="submit" class="primary">Add</button>
+        </form>
+        {% if ioc_error %}<p class="error">{{ ioc_error }}</p>{% endif %}
+        {% for category, values in iocs.items() %}
+          {% if values %}
+          <div class="ioc-cat">
+            <h3>{{ category }} ({{ values | length }})</h3>
+            {% for value in values %}
+            <span class="ioc-item">{{ value }}
+              <form method="post" action="/ui/iocs/remove" class="inline-form">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <input type="hidden" name="category" value="{{ category }}">
+                <input type="hidden" name="value" value="{{ value }}">
+                <button type="submit" title="remove">✕</button>
+              </form>
+            </span>
+            {% endfor %}
+          </div>
+          {% endif %}
+        {% endfor %}
+      </section>
+    </div>
+  </main>
+</body>
+</html>

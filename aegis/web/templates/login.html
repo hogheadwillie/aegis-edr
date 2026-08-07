@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aegis EDR — Sign in</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="login-card" method="post" action="/login" autocomplete="off">
+      <div class="brand">AEGIS <span>EDR</span></div>
+      <p class="muted">Paste your API token (found in <code>~/.aegis/api_token</code>).</p>
+      <input name="token" type="password" placeholder="API token" required minlength="32"
+             autofocus>
+      <button type="submit">Authenticate</button>
+      {% if error %}
+      <p class="error">{{ error }}</p>
+      {% endif %}
+    </form>
+  </div>
+</body>
+</html>
