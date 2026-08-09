@@ -50,6 +50,24 @@ class TestUserStore:
         with pytest.raises(ValueError):
             store.add_user("alice", "tooshort", "admin")
 
+    def test_common_password_rejected(self, store):
+        with pytest.raises(ValueError):
+            store.add_user("alice", "password123456", "admin")
+        store.add_user("alice", GOOD_PW, "admin")
+        with pytest.raises(ValueError):
+            store.change_password("alice", "qwerty123456")
+
+    def test_overlong_password_rejected(self, store):
+        with pytest.raises(ValueError):
+            store.add_user("alice", "x" * 129, "admin")
+
+    def test_verify_unknown_user_is_timing_safe_and_correct(self, store):
+        # No account exists: verify still runs a full Argon2id comparison
+        # against the dummy hash and cleanly returns None (no oracle, no crash).
+        assert store.verify("ghost", GOOD_PW) is None
+        store.add_user("alice", GOOD_PW, "admin")
+        assert store.verify("alice", GOOD_PW) is not None
+
     def test_bad_username_rejected(self, store):
         with pytest.raises(ValueError):
             store.add_user("al ice", GOOD_PW, "admin")
@@ -87,6 +105,12 @@ class TestAudit:
         events = load_events(path)
         assert [e["action"] for e in events] == ["user_add", "login"]  # newest first
         assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+    def test_ip_recorded(self, tmp_path):
+        path = tmp_path / "audit.jsonl"
+        log_event(path, "alice", "login", "", ip="203.0.113.10")
+        events = load_events(path)
+        assert events[0]["ip"] == "203.0.113.10"
 
 
 class TestMultiUserWeb:
@@ -166,3 +190,65 @@ class TestMultiUserWeb:
                    data={"csrf": csrf, "username": "bob7"}, follow_redirects=False)
         assert r.status_code == 303
         assert users.get("bob7") is None
+
+    def test_removed_user_sessions_are_revoked(self, client):
+        c, users = client
+        users.add_user("admin1", GOOD_PW, "admin")
+        users.add_user("bob7", GOOD_PW, "analyst")
+        bob_cookies = self._login(c, "bob7", GOOD_PW)
+        admin_cookies = self._login(c, "admin1", GOOD_PW)
+        csrf = self._csrf(c, admin_cookies)
+        c.post("/ui/users/remove", cookies=admin_cookies,
+               data={"csrf": csrf, "username": "bob7"}, follow_redirects=False)
+        r = c.get("/console", cookies=bob_cookies, follow_redirects=False)
+        assert r.status_code == 303  # bob's cookie died with his account
+
+    def test_account_lockout_after_repeated_failures(self, client, tmp_path):
+        c, users = client
+        users.add_user("admin1", GOOD_PW, "admin")
+        for _ in range(5):
+            self._login(c, "admin1", "wrong password!!", expect=401)
+        # the account itself is now locked — even the right password is refused
+        r = c.post("/login", data={"username": "admin1", "password": GOOD_PW},
+                   follow_redirects=False)
+        assert r.status_code in (429, 401)
+        events = load_events(tmp_path / "aegis_home" / "audit.jsonl")
+        assert any(e["action"] == "account_locked" for e in events)
+
+    def test_self_password_change_flow(self, client, tmp_path):
+        c, users = client
+        users.add_user("admin1", GOOD_PW, "admin")
+        cookies = self._login(c, "admin1", GOOD_PW)
+        csrf = self._csrf(c, cookies)
+        # wrong current password is refused
+        r = c.post("/ui/users/passwd", cookies=cookies,
+                   data={"csrf": csrf, "current_password": "not the password",
+                         "new_password": "brand new passphrase"},
+                   follow_redirects=False)
+        assert r.status_code == 303
+        assert users.verify("admin1", GOOD_PW) is not None
+        # correct current password rotates it and audits the change
+        r = c.post("/ui/users/passwd", cookies=cookies,
+                   data={"csrf": csrf, "current_password": GOOD_PW,
+                         "new_password": "brand new passphrase"},
+                   follow_redirects=False)
+        assert r.status_code == 303
+        assert users.verify("admin1", GOOD_PW) is None
+        assert users.verify("admin1", "brand new passphrase") is not None
+        events = load_events(tmp_path / "aegis_home" / "audit.jsonl")
+        assert any(e["action"] == "passwd_change" for e in events)
+
+    def test_password_change_revokes_other_sessions(self, client):
+        c, users = client
+        users.add_user("admin1", GOOD_PW, "admin")
+        first = self._login(c, "admin1", GOOD_PW)
+        second = self._login(c, "admin1", GOOD_PW)  # second device
+        csrf = self._csrf(c, first)
+        c.post("/ui/users/passwd", cookies=first,
+               data={"csrf": csrf, "current_password": GOOD_PW,
+                     "new_password": "brand new passphrase"},
+               follow_redirects=False)
+        # the session that changed the password survives; the other one dies
+        assert c.get("/console", cookies=first).status_code == 200
+        r = c.get("/console", cookies=second, follow_redirects=False)
+        assert r.status_code == 303

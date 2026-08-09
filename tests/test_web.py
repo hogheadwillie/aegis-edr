@@ -107,9 +107,43 @@ class TestSecurityHeaders:
         assert r.headers["Cache-Control"] == "no-store"
         assert "server" not in {k.lower() for k in r.headers}
 
+    def test_extended_headers(self, client):
+        r = client.get("/")
+        csp = r.headers["Content-Security-Policy"]
+        assert "default-src 'none'" in csp
+        assert "form-action 'self'" in csp
+        assert "base-uri 'none'" in csp
+        assert r.headers["Referrer-Policy"] == "no-referrer"
+        assert "camera=()" in r.headers["Permissions-Policy"]
+        assert r.headers["Cross-Origin-Opener-Policy"] == "same-origin"
+        assert r.headers["Cross-Origin-Resource-Policy"] == "same-origin"
+
     def test_no_api_schema_exposed(self, client):
         assert client.get("/openapi.json").status_code == 404
         assert client.get("/docs").status_code == 404
+
+
+class TestEdgeGuards:
+    def test_foreign_origin_post_refused(self, client):
+        r = client.post("/login", data={"token": "x" * 40},
+                        headers={"Origin": "http://evil.example"})
+        assert r.status_code == 403
+        # edge rejections still carry the security headers
+        assert r.headers["X-Content-Type-Options"] == "nosniff"
+
+    def test_foreign_referer_post_refused(self, client):
+        r = client.post("/ui/scan", data={"csrf": "x"},
+                        headers={"Referer": "http://evil.example/page"})
+        assert r.status_code == 403
+
+    def test_same_origin_post_allowed_through(self, client):
+        r = client.post("/login", data={"token": "wrong" * 8},
+                        headers={"Origin": "http://testserver"})
+        assert r.status_code == 401  # reached the route; auth failed as usual
+
+    def test_oversized_body_refused(self, client):
+        r = client.post("/login", content=b"x" * (70 * 1024))
+        assert r.status_code == 413
 
 
 class TestBrowserSessions:
@@ -209,6 +243,40 @@ class TestBrowserSessions:
         store2 = SessionStore(ttl_seconds=-1)
         sid2, _ = store2.create()
         assert store2.validate(sid2) is None
+
+    def test_session_sliding_expiration(self):
+        store = SessionStore(ttl_seconds=100)
+        sid, _ = store.create()
+        first_expiry = store._sessions[sid]["expires"]
+        assert store.validate(sid) is not None
+        assert store._sessions[sid]["expires"] > first_expiry
+
+    def test_per_user_session_cap_evicts_oldest(self):
+        store = SessionStore(ttl_seconds=60, max_per_user=2)
+        s1, _ = store.create(username="alice")
+        s2, _ = store.create(username="alice")
+        s3, _ = store.create(username="alice")  # evicts s1
+        assert store.validate(s1) is None
+        assert store.validate(s2) is not None
+        assert store.validate(s3) is not None
+
+    def test_destroy_all_revokes_user_sessions(self):
+        store = SessionStore(ttl_seconds=60)
+        a1, _ = store.create(username="alice")
+        a2, _ = store.create(username="alice")
+        b1, _ = store.create(username="bob")
+        assert store.destroy_all("alice") == 2
+        assert store.validate(a1) is None
+        assert store.validate(a2) is None
+        assert store.validate(b1) is not None
+
+    def test_destroy_all_can_keep_current_session(self):
+        store = SessionStore(ttl_seconds=60)
+        a1, _ = store.create(username="alice")
+        a2, _ = store.create(username="alice")
+        assert store.destroy_all("alice", keep_sid=a2) == 1
+        assert store.validate(a1) is None
+        assert store.validate(a2) is not None
 
 
 class TestEndpoints:

@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import List, Literal, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import (FileResponse, HTMLResponse, PlainTextResponse,
+                               RedirectResponse)
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -35,9 +36,10 @@ from ..detection.engine import DetectionEngine, load_iocs, load_rules
 from ..monitors import fim as fim_mod
 from .audit import log_event, load_events
 from .auth import UserStore
-from .security import (AuthLockout, RateLimiter, SecurityHeadersMiddleware,
+from .security import (AuthLockout, OriginCheckMiddleware, RateLimiter,
+                       RequestSizeLimitMiddleware, SecurityHeadersMiddleware,
                        check_token, load_or_create_token)
-from .sessions import SESSION_COOKIE, SessionStore
+from .sessions import (SECURE_SESSION_COOKIE, SESSION_COOKIE, SessionStore)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
@@ -73,10 +75,22 @@ def create_app(token_path: Path | str | None = None,
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 
     app = FastAPI(title="Aegis EDR", docs_url=None, redoc_url=None, openapi_url=None)
+    # Middleware execution order (outermost runs first): headers -> origin ->
+    # body size -> routes. Security headers wrap everything so even the 403/413
+    # edge rejections carry them.
+    app.add_middleware(RequestSizeLimitMiddleware)
+    app.add_middleware(OriginCheckMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
     limiter = RateLimiter(max_requests=120, window_seconds=60.0)
+    # Hot routes get their own, much tighter buckets.
+    login_limiter = RateLimiter(max_requests=10, window_seconds=60.0)
+    scan_limiter = RateLimiter(max_requests=10, window_seconds=60.0)
     lockout = AuthLockout(max_failures=5, lockout_seconds=300.0)
+    # Per-account lockout: stops distributed password-guessing against one
+    # username (per-IP lockout alone is trivially bypassed by rotating IPs).
+    user_lockout = AuthLockout(max_failures=5, lockout_seconds=600.0)
     sessions = SessionStore()
+    cookie_name = SECURE_SESSION_COOKIE if secure_cookies else SESSION_COOKIE
     users = UserStore(AEGIS_HOME / "users.json")
     audit_path = AEGIS_HOME / "audit.jsonl"
 
@@ -105,7 +119,7 @@ def create_app(token_path: Path | str | None = None,
     # -- browser session helpers ----------------------------------------------
 
     def _session(request: Request) -> Optional[dict]:
-        return sessions.validate(request.cookies.get(SESSION_COOKIE))
+        return sessions.validate(request.cookies.get(cookie_name))
 
     def _require_session(request: Request) -> dict:
         _throttle(request)
@@ -116,13 +130,22 @@ def create_app(token_path: Path | str | None = None,
 
     def _require_csrf(request: Request, csrf: str) -> dict:
         session = _require_session(request)
-        if not sessions.check_csrf(request.cookies.get(SESSION_COOKIE), csrf):
+        if not sessions.check_csrf(request.cookies.get(cookie_name), csrf):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "bad CSRF token")
         return session
 
     def _redirect_console(notice: str = "") -> RedirectResponse:
         location = "/console" + (f"?notice={notice}" if notice else "")
         return RedirectResponse(location, status_code=status.HTTP_303_SEE_OTHER)
+
+    # -- fail closed on unexpected errors --------------------------------------
+
+    @app.exception_handler(Exception)
+    async def unhandled_error(request: Request, exc: Exception) -> Response:
+        # Never leak internals — log the type server-side, answer generically.
+        log_event(audit_path, "(server)", "unhandled_error", type(exc).__name__,
+                  _client_ip(request))
+        return PlainTextResponse("internal error", status_code=500)
 
     # -- data helpers ----------------------------------------------------------
 
@@ -166,21 +189,33 @@ def create_app(token_path: Path | str | None = None,
               password: str = Form(default="", max_length=256),
               token: str = Form(default="", max_length=256)) -> Response:
         ip = _throttle(request)
+        if not login_limiter.allow(ip):
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                                "too many login attempts — slow down")
         mode = "users" if users.count() > 0 else "token"
 
-        def deny(msg: str) -> Response:
+        def deny(msg: str, code: int = status.HTTP_401_UNAUTHORIZED) -> Response:
             lockout.record_failure(ip)
-            log_event(audit_path, username or "(token)", "login_failed", msg)
+            log_event(audit_path, username or "(token)", "login_failed", msg, ip)
             return templates.TemplateResponse(
-                request, "login.html", {"error": msg, "mode": mode},
-                status_code=status.HTTP_401_UNAUTHORIZED)
+                request, "login.html", {"error": msg, "mode": mode}, status_code=code)
 
         if mode == "users":
-            user = users.verify(username.strip(), password) if username and password else None
+            uname = username.strip()
+            if user_lockout.is_locked(f"user:{uname}"):
+                log_event(audit_path, uname, "login_blocked", "account locked", ip)
+                return deny("Account temporarily locked — try again later.",
+                            status.HTTP_429_TOO_MANY_REQUESTS)
+            user = users.verify(uname, password) if uname and password else None
             if user is None:
+                user_lockout.record_failure(f"user:{uname}")
+                if user_lockout.is_locked(f"user:{uname}"):
+                    log_event(audit_path, uname, "account_locked",
+                              "5 failed logins", ip)
                 return deny("Invalid username or password.")
+            user_lockout.record_success(f"user:{uname}")
             sid, _csrf = sessions.create(username=user.username, role=user.role)
-            log_event(audit_path, user.username, "login", "")
+            log_event(audit_path, user.username, "login", "", ip)
         else:
             if not token or not check_token(token, load_or_create_token()):
                 return deny("Invalid token — access denied.")
@@ -188,15 +223,20 @@ def create_app(token_path: Path | str | None = None,
 
         lockout.record_success(ip)
         response = RedirectResponse("/console", status_code=status.HTTP_303_SEE_OTHER)
-        response.set_cookie(SESSION_COOKIE, sid, max_age=int(sessions.ttl),
+        response.set_cookie(cookie_name, sid, max_age=int(sessions.ttl),
                             httponly=True, samesite="strict", secure=secure_cookies)
         return response
 
     @app.post("/logout", include_in_schema=False)
     def logout(request: Request) -> RedirectResponse:
-        sessions.destroy(request.cookies.get(SESSION_COOKIE))
+        sid = request.cookies.get(cookie_name)
+        session = sessions.validate(sid)
+        if session is not None:
+            log_event(audit_path, session.get("username", "?"), "logout", "",
+                      _client_ip(request))
+        sessions.destroy(sid)
         response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
-        response.delete_cookie(SESSION_COOKIE)
+        response.delete_cookie(cookie_name)
         return response
 
     @app.get("/console", response_class=HTMLResponse, include_in_schema=False)
@@ -235,15 +275,21 @@ def create_app(token_path: Path | str | None = None,
 
     @app.post("/ui/scan", include_in_schema=False)
     def ui_scan(request: Request, csrf: str = Form(default="")) -> RedirectResponse:
-        _require_csrf(request, csrf)
+        session = _require_csrf(request, csrf)
+        ip = _client_ip(request)
+        if not scan_limiter.allow(ip):
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                                "scans are rate-limited — wait a moment")
         alerts = _agent().full_scan()
+        log_event(audit_path, session.get("username", "?"), "scan",
+                  f"{len(alerts)} new alert(s)", ip)
         return _redirect_console(f"Scan complete: {len(alerts)} new alert(s).")
 
     @app.post("/ui/iocs/add", include_in_schema=False)
     def ui_iocs_add(request: Request, csrf: str = Form(default=""),
                     category: str = Form(default=""),
                     value: str = Form(default="")) -> RedirectResponse:
-        _require_csrf(request, csrf)  # CSRF check precedes all input handling
+        session = _require_csrf(request, csrf)  # CSRF check precedes all input handling
         value = value.strip()
         if category not in ("ip", "domain", "sha256") or not IOC_VALUE_RE.match(value) \
                 or len(value) > 256:
@@ -251,6 +297,8 @@ def create_app(token_path: Path | str | None = None,
         iocs = load_iocs(AEGIS_HOME / "iocs.json")
         iocs.setdefault(category, set()).add(value)
         _write_iocs(iocs)
+        log_event(audit_path, session.get("username", "?"), "ioc_add",
+                  f"{category}:{value[:120]}", _client_ip(request))
         return _redirect_console()
 
     @app.post("/ui/iocs/remove", include_in_schema=False)
@@ -262,7 +310,8 @@ def create_app(token_path: Path | str | None = None,
             iocs = load_iocs(AEGIS_HOME / "iocs.json")
             iocs.setdefault(category, set()).discard(value)
             _write_iocs(iocs)
-            log_event(audit_path, session.get("username", "?"), "ioc_remove", value[:120])
+            log_event(audit_path, session.get("username", "?"), "ioc_remove",
+                      value[:120], _client_ip(request))
         return _redirect_console()
 
     # -- user administration (admin only) -------------------------------------
@@ -281,7 +330,8 @@ def create_app(token_path: Path | str | None = None,
         session = _require_admin(request, csrf)
         try:
             users.add_user(username, password, role)
-            log_event(audit_path, session.get("username", "?"), "user_add", username.strip())
+            log_event(audit_path, session.get("username", "?"), "user_add",
+                      username.strip(), _client_ip(request))
         except ValueError:
             pass  # invalid input or duplicate — silently refused
         return _redirect_console()
@@ -290,12 +340,37 @@ def create_app(token_path: Path | str | None = None,
     def ui_users_remove(request: Request, csrf: str = Form(default=""),
                         username: str = Form(default="", max_length=32)) -> RedirectResponse:
         session = _require_admin(request, csrf)
+        uname = username.strip()
         try:
-            users.remove_user(username.strip())
-            log_event(audit_path, session.get("username", "?"), "user_remove", username.strip())
+            users.remove_user(uname)
+            sessions.destroy_all(uname)  # a removed account keeps no sessions
+            log_event(audit_path, session.get("username", "?"), "user_remove",
+                      uname, _client_ip(request))
         except ValueError:
             pass  # unknown user or last admin — refused
         return _redirect_console()
+
+    @app.post("/ui/users/passwd", include_in_schema=False)
+    def ui_users_passwd(request: Request, csrf: str = Form(default=""),
+                        current_password: str = Form(default="", max_length=256),
+                        new_password: str = Form(default="", max_length=256)) -> RedirectResponse:
+        session = _require_csrf(request, csrf)
+        ip = _client_ip(request)
+        username = session.get("username", "")
+        if username == "(token)":
+            return _redirect_console("Token sessions have no password to change.")
+        if users.verify(username, current_password) is None:
+            log_event(audit_path, username, "passwd_failed", "", ip)
+            return _redirect_console("Password change refused: current password wrong.")
+        try:
+            users.change_password(username, new_password)
+        except ValueError as exc:
+            return _redirect_console(f"Password change refused: {exc}")
+        # Revoke every other session of this account — a password change is
+        # exactly the moment stolen cookies must die.
+        sessions.destroy_all(username, keep_sid=request.cookies.get(cookie_name))
+        log_event(audit_path, username, "passwd_change", "", ip)
+        return _redirect_console("Password updated — other sessions revoked.")
 
     # ======================================================================
     # JSON API (bearer token, unchanged)
@@ -319,7 +394,10 @@ def create_app(token_path: Path | str | None = None,
         return {"total": len(alerts), "alerts": [a.to_dict() for a in alerts]}
 
     @app.post("/api/scan", response_model=ScanOut)
-    def run_scan(_: None = Depends(require_auth)) -> dict:
+    def run_scan(request: Request, _: None = Depends(require_auth)) -> dict:
+        if not scan_limiter.allow(_client_ip(request)):
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                                "scans are rate-limited — wait a moment")
         alerts = _agent().full_scan()
         return {"alerts_created": len(alerts), "alerts": [a.to_dict() for a in alerts]}
 

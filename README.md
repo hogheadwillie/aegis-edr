@@ -106,17 +106,7 @@ Operators: `eq`, `ne`, `gt`, `lt`, `in`, `contains`, `contains_any`, `startswith
 
 ```bash
 pip install pytest httpx
-python -m pytest tests/ -v   # 57 tests (core + web security + multi-user auth)
-```
-
-## Managing accounts
-
-```bash
-python -m aegis user add alice --role admin           # generates a strong password
-python -m aegis user add bob --role analyst --password '...'
-python -m aegis user passwd alice                     # interactive change
-python -m aegis user list
-python -m aegis user remove bob                       # last admin is protected
+python -m pytest tests/ -v   # 74 tests (core + web security + multi-user auth)
 ```
 
 ## Deploying behind nginx (TLS termination)
@@ -140,6 +130,19 @@ exchange, OpenSSL 3.5 / nginx builds with ML-KEM (X25519MLKEM768) hybrid
 groups make the TLS layer itself quantum-resistant — that lives at the proxy,
 not the app.
 
+## Managing accounts & the API token
+
+```bash
+python -m aegis user add alice --role admin           # generates a strong password
+python -m aegis user add bob --role analyst --password '...'
+python -m aegis user passwd alice                     # interactive change
+python -m aegis user list
+python -m aegis user remove bob                       # last admin is protected
+
+python -m aegis token show                            # print the JSON API token
+python -m aegis token rotate                          # new token, old one dies instantly
+```
+
 ## Web console & API security — pure Python, zero JavaScript
 
 The web layer (`aegis serve`) is a fully server-rendered application: **every
@@ -148,25 +151,31 @@ HTML rendered by FastAPI — there is no JavaScript anywhere in the stack.
 
 **Browser UI (server-rendered)**
 - **Multi-user accounts** with quantum-resistant password hashing: Argon2id (RFC 9106, OWASP parameters — 64 MiB, 3 iterations). Argon2id's security is unaffected by Shor's algorithm and Grover's only halves symmetric strength, so brute force stays infeasible for classical *and* quantum adversaries. Only hashes are ever stored (0600 file).
+- Password policy: 12–128 chars, offline common-password blocklist, and a full Argon2id verification runs even for nonexistent usernames — response timing can't enumerate accounts.
 - Roles: `admin` (manage users, view audit log) and `analyst` (console only). Single-token mode remains until the first account is created (`aegis user add <name> --role admin`); the last admin cannot be removed.
-- Audit trail: logins, failed logins, user/IOC changes appended to `~/.aegis/audit.jsonl` (0600).
-- The browser only holds an opaque session cookie — `HttpOnly`, `SameSite=Strict`, 12 h expiry, `Secure` with `--secure-cookies`
-- Per-session CSRF tokens required on every form POST (scan, IOC add/remove, user admin), verified before any input handling
-- Jinja2 autoescaping makes all rendered alert/rule/IOC data XSS-safe by default
-- Post/Redirect/Get pattern throughout — no resubmission pitfalls
+- **Per-account lockout** (5 failures → 10 min) stops distributed password guessing that per-IP lockouts alone can't; lockouts are audited.
+- Audit trail: logins, failed logins, lockouts, scans, password changes, and user/IOC changes appended to `~/.aegis/audit.jsonl` (0600) — with client IP on every event.
+- Self-service password change in the console; changing a password **revokes every other session** of the account, and removing a user kills their sessions instantly.
+- Sessions: opaque cookie (`HttpOnly`, `SameSite=Strict`, 12 h sliding expiry, `Secure` + `__Host-` prefix with `--secure-cookies`), per-session CSRF token on every form POST, max 5 concurrent sessions per user (oldest evicted).
+- Jinja2 autoescaping makes all rendered alert/rule/IOC data XSS-safe by default; Post/Redirect/Get throughout.
 
 **JSON API (`/api/*`, for scripts)**
-- Bearer-token auth on every route, 256-bit token generated on first run and stored `0600` in a `0700` directory
+- Bearer-token auth on every route, 256-bit token generated on first run and stored `0600` in a `0700` directory; `aegis token rotate` invalidates it on demand
 - Constant-time token comparison (`hmac.compare_digest`) — no timing oracle
 
+**Edge guards (run before any route)**
+- Origin/Referer enforcement: cross-site POSTs are 403'd at the edge — second CSRF layer behind the token check
+- Request body cap (64 KiB → 413) before any parsing
+- Per-IP sliding-window rate limiting (120 req/min global; 10 req/min on `/login` and scans) and brute-force lockout (5 failures → 5 min) on both surfaces
+
 **Shared defenses**
-- Per-IP sliding-window rate limiting (120 req/min) and brute-force lockout (5 failures → 5 min) on both surfaces
-- Security headers on every response: strict CSP (`script-src 'self'`, `frame-ancestors 'none'`), `nosniff`, `DENY` framing, `no-store`, `Server` header stripped
+- Security headers on every response (including edge rejections): strict CSP (`default-src 'none'`, `form-action 'self'`, `frame-ancestors 'none'`, `base-uri 'none'`), `nosniff`, `DENY` framing, `no-store`, `no-referrer`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`, `Cross-Origin-Resource-Policy`, `Server` header stripped
 - No CORS (same-origin only), no `docs`/`openapi.json` exposed, validated inputs, path-traversal guards on static files and FIM directories
-- Binds to `127.0.0.1` by default; refuses non-loopback binds without `--allow-remote`
+- Unhandled exceptions return a generic 500 and are written to the audit log — internals never leak
+- Binds to `127.0.0.1` by default; refuses non-loopback binds without `--allow-remote` (put it behind a TLS-terminating proxy for remote use)
 
 **Core hardening (applies to the CLI too)**
-- Alert log, IOC store, FIM baselines, users file, and API token are written `0600` inside `0700` directories
+- Alert log, IOC store, FIM baselines, and API token are written `0600` inside `0700` directories
 - Rule files: 5 MB size cap, 10k rule cap, strict schema validation
 
 ### API endpoints

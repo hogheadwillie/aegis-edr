@@ -91,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_upw = user_sub.add_parser("passwd", help="change a password")
     p_upw.add_argument("username")
     user_sub.add_parser("list", help="show accounts")
+
+    p_token = sub.add_parser("token", help="manage the JSON API token")
+    token_sub = p_token.add_subparsers(dest="token_command", required=True)
+    token_sub.add_parser("show", help="print the current token")
+    token_sub.add_parser("rotate", help="generate a new token, invalidating the old one")
     return parser
 
 
@@ -142,6 +147,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "user":
         return _cmd_user(args)
 
+    if args.command == "token":
+        return _cmd_token(args)
+
+    return 0
+
+
+def _cmd_token(args) -> int:
+    from .web.security import load_or_create_token
+
+    path = AEGIS_HOME / "api_token"
+    if args.token_command == "rotate":
+        path.unlink(missing_ok=True)  # force regeneration below
+        token = load_or_create_token(path)
+        print(f"Rotated API token (old one is dead): {token}")
+        print("Restart 'aegis serve' for the running dashboard to pick it up.")
+    else:
+        print(load_or_create_token(path))
     return 0
 
 
