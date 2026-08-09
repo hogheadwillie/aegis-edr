@@ -28,11 +28,33 @@ from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchErro
 ROLES = ("admin", "analyst")
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.\-]{3,32}$")
 MIN_PASSWORD_LENGTH = 12
+MAX_PASSWORD_LENGTH = 128  # cap KDF input — unbounded input is a DoS lever
+
+# Offline blocklist: trivially-guessable passwords that meet the length rule.
+# (Full breach-corpus checks need network access; this catches the classics.)
+COMMON_PASSWORDS = frozenset({
+    "password1234", "password12345", "password123456", "123456789012",
+    "qwerty123456", "qwertyuiop12", "letmein12345", "welcome12345",
+    "admin1234567", "changeme1234", "iloveyou1234", "abc123456789",
+})
 
 DEFAULT_USERS_PATH = Path.home() / ".aegis" / "users.json"
 
 # OWASP-recommended interactive parameters: 64 MiB, 3 iterations, 4 lanes.
 _hasher = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
+
+# Pre-computed dummy hash: verify() runs a full Argon2id comparison even when
+# the username does not exist, so response timing can't enumerate accounts.
+_DUMMY_HASH = _hasher.hash("aegis timing-equalization sentinel")
+
+
+def _check_password_policy(password: str) -> None:
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+    if len(password) > MAX_PASSWORD_LENGTH:
+        raise ValueError(f"password must be at most {MAX_PASSWORD_LENGTH} characters")
+    if password.lower() in COMMON_PASSWORDS:
+        raise ValueError("password is too common — pick something harder to guess")
 
 
 @dataclass
@@ -85,8 +107,7 @@ class UserStore:
             raise ValueError("username must be 3-32 chars of [a-zA-Z0-9_.-]")
         if role not in ROLES:
             raise ValueError(f"role must be one of {ROLES}")
-        if len(password) < MIN_PASSWORD_LENGTH:
-            raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+        _check_password_policy(password)
         users = self._load()
         if username in users:
             raise ValueError(f"user {username!r} already exists")
@@ -105,8 +126,7 @@ class UserStore:
         self._save(users)
 
     def change_password(self, username: str, new_password: str) -> None:
-        if len(new_password) < MIN_PASSWORD_LENGTH:
-            raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+        _check_password_policy(new_password)
         users = self._load()
         if username not in users:
             raise ValueError(f"no user {username!r}")
@@ -117,14 +137,17 @@ class UserStore:
 
     def verify(self, username: str, password: str) -> Optional[User]:
         rec = self._load().get(username)
-        if rec is None:
-            return None
+        # Always run one full Argon2id verification — against the real hash if
+        # the account exists, against the dummy otherwise — so attackers can't
+        # tell "no such user" from "wrong password" by response time.
+        target = rec["pw"] if rec is not None else _DUMMY_HASH
         try:
-            if _hasher.verify(rec["pw"], password):
-                return User(username=username, role=rec["role"])
+            ok = _hasher.verify(target, password)
         except (VerifyMismatchError, VerificationError, InvalidHash):
-            pass
-        return None
+            ok = False
+        if rec is None or not ok:
+            return None
+        return User(username=username, role=rec["role"])
 
 
 def generate_password(length: int = 20) -> str:

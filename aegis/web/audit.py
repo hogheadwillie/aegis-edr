@@ -1,4 +1,4 @@
-"""Audit log: who did what, when — appended as JSONL, 0600 perms."""
+"""Audit log: who did what, when, from where — appended as JSONL, 0600 perms."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from typing import List, Optional
 DEFAULT_AUDIT_PATH = Path.home() / ".aegis" / "audit.jsonl"
 
 
-def log_event(path: Path | str, user: str, action: str, detail: str = "") -> None:
+def log_event(path: Path | str, user: str, action: str, detail: str = "",
+              ip: str = "") -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
@@ -19,9 +20,10 @@ def log_event(path: Path | str, user: str, action: str, detail: str = "") -> Non
         os.close(fd)
     record = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "user": user,
-        "action": action,
+        "user": user[:64],
+        "action": action[:64],
         "detail": detail[:300],
+        "ip": ip[:45],  # fits an IPv6 literal
     }
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")

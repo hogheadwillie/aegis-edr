@@ -4,7 +4,9 @@
 - Constant-time token comparison (no timing oracle).
 - Sliding-window rate limiter (in-memory, per-client).
 - Brute-force lockout on repeated auth failures.
-- Strict HTTP security headers middleware.
+- Strict HTTP security headers middleware (CSP, COOP/CORP, Permissions-Policy).
+- Origin/Referer enforcement on state-changing requests (CSRF layer two).
+- Request body size cap (413 before any parsing happens).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Deque, Dict, Tuple
+from urllib.parse import urlsplit
 
 TOKEN_PATH_DEFAULT = Path.home() / ".aegis" / "api_token"
 
@@ -95,11 +98,18 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Permissions-Policy": (
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), "
+        "bluetooth=(), magnetometer=(), gyroscope=(), accelerometer=()"
+    ),
+    # Cross-origin isolation: our pages must not be embeddable or reusable
+    # by foreign origins (Spectre-class + clickjacking defense in depth).
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
     "Content-Security-Policy": (
-        "default-src 'self'; script-src 'self'; style-src 'self'; "
-        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
-        "base-uri 'none'; form-action 'none'"
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "img-src 'self'; font-src 'self'; connect-src 'self'; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     ),
     "Cache-Control": "no-store",
 }
@@ -127,3 +137,79 @@ class SecurityHeadersMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
+
+
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+class OriginCheckMiddleware:
+    """Reject cross-origin state-changing requests at the edge.
+
+    The per-session CSRF token is the primary defense; this is layer two.
+    A browser-driven cross-site POST always carries an Origin (or at least a
+    Referer) header — if either is present and points at a foreign host, the
+    request is refused with 403 before reaching any route. Header-less
+    requests (curl, scripts) are allowed through and remain subject to
+    bearer-token / session auth as usual.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope.get("method") not in SAFE_METHODS:
+            headers = {k.decode().lower(): v.decode()
+                       for k, v in scope.get("headers", [])}
+            host = headers.get("host", "")
+            for source in ("origin", "referer"):
+                value = headers.get(source)
+                if value:
+                    origin_host = urlsplit(value).netloc
+                    # netloc includes the port; compare case-insensitively.
+                    if host and origin_host.lower() != host.lower():
+                        await self._forbid(send)
+                        return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _forbid(send) -> None:
+        body = b"cross-origin request refused"
+        await send({"type": "http.response.start", "status": 403,
+                    "headers": [(b"content-type", b"text/plain"),
+                                (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+
+MAX_BODY_BYTES = 64 * 1024  # the UI/API never accepts payloads beyond 64 KiB
+
+
+class RequestSizeLimitMiddleware:
+    """413 any request whose declared body exceeds MAX_BODY_BYTES.
+
+    Checked before routing, so oversized posts can't burn CPU on parsing
+    (the brute-force surface stays tiny). Requests that omit Content-Length
+    (chunked or empty-body API clients like curl) are allowed through.
+    """
+
+    def __init__(self, app, max_bytes: int = MAX_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope.get("method") not in SAFE_METHODS:
+            headers = {k.decode().lower(): v.decode()
+                       for k, v in scope.get("headers", [])}
+            length = headers.get("content-length")
+            if length is not None and (not length.isdigit()
+                                       or int(length) > self.max_bytes):
+                await self._too_large(send)
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _too_large(send) -> None:
+        body = b"request body too large"
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"text/plain"),
+                                (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
