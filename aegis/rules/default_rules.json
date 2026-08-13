@@ -17,6 +17,7 @@
     "event_type": "process",
     "description": "The process executable was deleted after launch (memfd/self-deleting dropper), indicating in-memory payload execution.",
     "mitre": ["T1055", "T1620"],
+    "response": "kill_process",
     "conditions": [
       {"field": "exe_deleted", "op": "eq", "value": true}
     ]
@@ -65,6 +66,7 @@
     "event_type": "network",
     "description": "An established connection to an IP on the IOC feed was observed.",
     "mitre": ["T1071"],
+    "response": "block_ip",
     "conditions": [
       {"field": "remote_ip", "op": "in_ioc", "value": "ip"}
     ]
@@ -100,6 +102,7 @@
     "event_type": "network",
     "description": "A shell-like process is listening for inbound connections, consistent with a bind shell backdoor.",
     "mitre": ["T1059", "T1571"],
+    "response": "kill_process",
     "conditions": [
       {"field": "direction", "op": "eq", "value": "listen"},
       {"field": "is_shell", "op": "eq", "value": true}
@@ -137,6 +140,7 @@
     "event_type": "file_change",
     "description": "A new file appeared under a temp directory — common staging behavior.",
     "mitre": ["T1070", "T1059"],
+    "response": "quarantine_file",
     "conditions": [
       {"field": "change", "op": "eq", "value": "created"},
       {"field": "path", "op": "startswith", "value": "/tmp/"}

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from ..alerts import Alert, SEVERITIES
+from ..response.actions import VALID_RESPONSES
 
 
 @dataclass
@@ -65,6 +66,7 @@ class Rule:
     logic: str = "all"
     mitre: List[str] = field(default_factory=list)
     enabled: bool = True
+    response: Optional[str] = None  # optional containment action on match
 
     @classmethod
     def from_dict(cls, data: dict) -> "Rule":
@@ -74,11 +76,16 @@ class Rule:
         logic = data.get("logic", "all")
         if logic not in ("all", "any"):
             raise ValueError(f"rule {data.get('id')}: logic must be 'all' or 'any'")
+        response = data.get("response")
+        if response is not None and response not in VALID_RESPONSES:
+            raise ValueError(
+                f"rule {data.get('id')}: response must be one of {VALID_RESPONSES}")
         return cls(
             id=data["id"], name=data["name"], severity=data["severity"],
             event_type=data["event_type"], description=data.get("description", ""),
             conditions=conditions, logic=logic,
             mitre=data.get("mitre", []), enabled=data.get("enabled", True),
+            response=response,
         )
 
     def matches(self, event: dict, iocs: Dict[str, set]) -> bool:

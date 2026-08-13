@@ -34,7 +34,11 @@ def _build_agent(args) -> Agent:
     engine = DetectionEngine(rules, iocs, host=hostname())
     sink = AlertSink(AEGIS_HOME / "alerts.jsonl", echo=not getattr(args, "quiet", False),
                      min_severity=getattr(args, "min_severity", "low"))
-    return Agent(engine, sink)
+    responder = None
+    if getattr(args, "auto_respond", False):
+        from .response.actions import Responder
+        responder = Responder(dry_run=not getattr(args, "execute", False))
+    return Agent(engine, sink, responder=responder)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,12 +57,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--interval", type=float, default=5.0, help="seconds between polls")
     p_watch.add_argument("--cycles", type=int, help="stop after N polls (default: run until Ctrl-C)")
 
+    for p in (sub.choices["scan"], p_watch):
+        p.add_argument("--auto-respond", action="store_true",
+                       help="run rule-declared containment on alerts (dry-run unless --execute)")
+        p.add_argument("--execute", action="store_true",
+                       help="actually perform containment actions (default: dry-run)")
+
     p_fim = sub.add_parser("fim", help="file integrity monitoring")
     fim_sub = p_fim.add_subparsers(dest="fim_command", required=True)
     p_base = fim_sub.add_parser("baseline", help="record a baseline for a directory")
     p_base.add_argument("directory", type=Path)
     p_check = fim_sub.add_parser("check", help="diff a directory against its baseline")
     p_check.add_argument("directory", type=Path)
+    p_check.add_argument("--auto-respond", action="store_true",
+                         help="run rule-declared containment on alerts (dry-run unless --execute)")
+    p_check.add_argument("--execute", action="store_true",
+                         help="actually perform containment actions (default: dry-run)")
 
     p_ioc = sub.add_parser("ioc", help="manage the IOC feed")
     ioc_sub = p_ioc.add_subparsers(dest="ioc_command", required=True)
@@ -96,6 +110,24 @@ def build_parser() -> argparse.ArgumentParser:
     token_sub = p_token.add_subparsers(dest="token_command", required=True)
     token_sub.add_parser("show", help="print the current token")
     token_sub.add_parser("rotate", help="generate a new token, invalidating the old one")
+
+    p_resp = sub.add_parser("respond", help="manual containment actions (dry-run by default)")
+    p_resp.add_argument("--execute", action="store_true",
+                        help="actually perform the action (default: dry-run)")
+    resp_sub = p_resp.add_subparsers(dest="respond_command", required=True)
+    p_rkill = resp_sub.add_parser("kill", help="terminate a process (SIGTERM, then SIGKILL)")
+    p_rkill.add_argument("pid", type=int)
+    p_rq = resp_sub.add_parser("quarantine", help="move a file into the quarantine vault")
+    p_rq.add_argument("path", type=Path)
+    p_rr = resp_sub.add_parser("restore", help="restore a quarantined file by id prefix")
+    p_rr.add_argument("quarantine_id")
+    p_rb = resp_sub.add_parser("block", help="firewall-block an IP (iptables DROP)")
+    p_rb.add_argument("ip")
+    p_ru = resp_sub.add_parser("unblock", help="remove firewall rules for an IP")
+    p_ru.add_argument("ip")
+    resp_sub.add_parser("blocked", help="list firewall-blocked IPs")
+    resp_sub.add_parser("vault", help="list quarantined files")
+    resp_sub.add_parser("log", help="show the response action log")
     return parser
 
 
@@ -104,6 +136,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "ioc":
         return _cmd_ioc(args)
+
+    if args.command == "respond":
+        return _cmd_respond(args)
 
     agent = _build_agent(args)
 
@@ -151,6 +186,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_token(args)
 
     return 0
+
+
+def _cmd_respond(args) -> int:
+    from .response.actions import Responder
+
+    responder = Responder(dry_run=not args.execute)
+    cmd = args.respond_command
+    if cmd == "kill":
+        result = responder.kill_process(args.pid)
+    elif cmd == "quarantine":
+        result = responder.quarantine_file(args.path)
+    elif cmd == "restore":
+        result = responder.restore_file(args.quarantine_id)
+    elif cmd == "block":
+        result = responder.block_ip(args.ip)
+    elif cmd == "unblock":
+        result = responder.unblock_ip(args.ip)
+    elif cmd == "blocked":
+        blocked = responder.blocked_ips()
+        print("\n".join(blocked) if blocked else "No blocked IPs.")
+        return 0
+    elif cmd == "vault":
+        for entry in responder.manifest():
+            print(f"  {entry['id'][:16]}…  {entry['original_path']}  ({entry['size']} B)")
+        if not responder.manifest():
+            print("Quarantine vault is empty.")
+        return 0
+    else:  # log
+        events = responder.log.load()
+        if not events:
+            print("No response actions recorded.")
+        for e in events:
+            mark = "OK " if e["success"] else "ERR"
+            mode = "dry" if e["dry_run"] else "EXE"
+            print(f"[{mark}|{mode}] {e['ts']} {e['action']:16} {e['target']:40} {e['detail']}")
+        return 0
+    print(("DRY-RUN " if result.dry_run else "") + result.detail)
+    return 0 if result.success else 1
 
 
 def _cmd_token(args) -> int:

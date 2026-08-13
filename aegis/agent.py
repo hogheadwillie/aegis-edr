@@ -10,14 +10,18 @@ from typing import Iterable, List, Optional, Set
 from .alerts import Alert, AlertSink
 from .detection.engine import DetectionEngine
 from .monitors import fim, network, process
+from .response.actions import Responder
 
 
 class Agent:
     """The host agent. One-shot scans or a continuous watch loop."""
 
-    def __init__(self, engine: DetectionEngine, sink: AlertSink) -> None:
+    def __init__(self, engine: DetectionEngine, sink: AlertSink,
+                 responder: Optional[Responder] = None) -> None:
         self.engine = engine
         self.sink = sink
+        self.responder = responder
+        self._rules_by_id = {r.id: r for r in engine.rules}
         self._seen: Set[str] = set()  # dedup within a watch session
 
     # -- one-shot scans ----------------------------------------------------
@@ -60,6 +64,9 @@ class Agent:
                 continue
             self._seen.add(key)
             self.sink.emit(alert)
+            if self.responder is not None:
+                # Containment runs after the alert is safely logged.
+                self.responder.handle_alert(alert, self._rules_by_id)
             fresh.append(alert)
         return fresh
 
