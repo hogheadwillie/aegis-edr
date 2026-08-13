@@ -1,6 +1,6 @@
 # Aegis EDR
 
-A host-based Endpoint Detection & Response (EDR) tool in Python, modeled on how platforms like CrowdStrike Falcon work: a lightweight agent monitors **processes, network connections, and file integrity**, matches observations against a **behavioral rule engine** mapped to MITRE ATT&CK, and produces **severity-scored alerts**. **Every line of executable code in this project is Python** — including the web console, which is server-rendered with zero JavaScript.
+A host-based Endpoint Detection & Response (EDR) tool in Python, modeled on how platforms like CrowdStrike Falcon work: a lightweight agent monitors **processes, network connections, and file integrity**, matches observations against a **behavioral rule engine** mapped to MITRE ATT&CK, produces **severity-scored alerts**, and can take **active response actions** — kill the process, quarantine the file, firewall-block the C2. Every line of executable code in this project is Python — including the web console, which is server-rendered with zero JavaScript.
 
 > **Defensive security tool.** Only run Aegis on hosts you own or are explicitly authorized to monitor. It performs no offensive actions — detection and logging only.
 
@@ -25,6 +25,11 @@ A host-based Endpoint Detection & Response (EDR) tool in Python, modeled on how 
               └──────────┬──────────┘
                          ▼
               ┌─────────────────────┐
+              │  Active response    │  kill process, quarantine file,
+              │  (safe-by-default)  │  firewall-block C2 — dry-run first
+              └──────────┬──────────┘
+                         ▼
+              ┌─────────────────────┐
               │  Web layer (pure    │  server-rendered console
               │  Python, no JS)     │  + bearer-token JSON API
               └─────────────────────┘
@@ -32,20 +37,20 @@ A host-based Endpoint Detection & Response (EDR) tool in Python, modeled on how 
 
 ## Built-in detections (12 rules, MITRE-mapped)
 
-| Rule | Detection | Severity | ATT&CK |
-|------|-----------|----------|--------|
-| PROC-001 | Execution from temp directory | high | T1059, T1070 |
-| PROC-002 | Fileless / deleted-binary execution | critical | T1055, T1620 |
-| PROC-003 | Obfuscated or encoded command line | high | T1027, T1140 |
-| PROC-004 | Credential store access attempt | high | T1003, T1552 |
-| PROC-005 | Download-and-execute cradle | medium | T1105, T1059 |
-| NET-001 | Connection to known-malicious IP (IOC) | critical | T1071 |
-| NET-002 | Connection on classic C2 port | medium | T1071, T1571 |
-| NET-003 | Possible reverse shell | high | T1059, T1071 |
-| NET-004 | Shell listening on network port | critical | T1059, T1571 |
-| FIM-001 | Sensitive account/auth file changed | critical | T1098, T1136, T1556 |
-| FIM-002 | New content in startup/persistence location | high | T1547, T1053 |
-| FIM-003 | Executable written to temp directory | medium | T1070, T1059 |
+| Rule | Detection | Severity | ATT&CK | Response |
+|------|-----------|----------|--------|----------|
+| PROC-001 | Execution from temp directory | high | T1059, T1070 | — |
+| PROC-002 | Fileless / deleted-binary execution | critical | T1055, T1620 | kill_process |
+| PROC-003 | Obfuscated or encoded command line | high | T1027, T1140 | — |
+| PROC-004 | Credential store access attempt | high | T1003, T1552 | — |
+| PROC-005 | Download-and-execute cradle | medium | T1105, T1059 | — |
+| NET-001 | Connection to known-malicious IP (IOC) | critical | T1071 | block_ip |
+| NET-002 | Connection on classic C2 port | medium | T1071, T1571 | — |
+| NET-003 | Possible reverse shell | high | T1059, T1071 | — |
+| NET-004 | Shell listening on network port | critical | T1059, T1571 | kill_process |
+| FIM-001 | Sensitive account/auth file changed | critical | T1098, T1136, T1556 | — |
+| FIM-002 | New content in startup/persistence location | high | T1547, T1053 | — |
+| FIM-003 | Executable written to temp directory | medium | T1070, T1059 | quarantine_file |
 
 ## Usage
 
@@ -69,10 +74,19 @@ python -m aegis ioc list
 # summarize the alert log
 python -m aegis report --severity high
 
-# web console + REST API (localhost only, server-rendered, no JavaScript)
+# active response: dry-run by default, --execute to act for real
+python -m aegis scan --auto-respond                  # show what WOULD be contained
+python -m aegis scan --auto-respond --execute        # contain matching threats now
+python -m aegis respond kill 1337 --execute          # manual containment
+python -m aegis respond quarantine /tmp/dropper.sh --execute
+python -m aegis respond restore cebf25e0             # put a quarantined file back
+python -m aegis respond block 203.0.113.66 --execute # iptables DROP (needs root)
+python -m aegis respond vault / blocked / log        # inspect state + audit trail
+
+# web dashboard + REST API (localhost only, token-authenticated)
 pip install ".[web]"
-python -m aegis serve                    # http://127.0.0.1:8765
-python -m aegis serve --secure-cookies   # when serving over HTTPS
+python -m aegis serve            # http://127.0.0.1:8765
+cat ~/.aegis/api_token           # paste into the dashboard login
 ```
 
 Install as a package to get the `aegis` command: `pip install .`
@@ -102,11 +116,31 @@ Operators: `eq`, `ne`, `gt`, `lt`, `in`, `contains`, `contains_any`, `startswith
 `endswith`, `regex`, `exists`, `in_ioc`. Combine conditions with
 `"logic": "all"` (default, AND) or `"any"` (OR).
 
+Add `"response": "kill_process" | "quarantine_file" | "block_ip"` to have the
+agent contain the threat when the rule fires (only with `--auto-respond`;
+dry-run unless `--execute` is also given).
+
+## Active response
+
+CrowdStrike-style containment, safe by default — **nothing executes without
+`--execute`**, and every action (executed, dry-run, or refused) is appended to
+`~/.aegis/response.jsonl` (0600):
+
+| Action | What it does | Guard rails |
+|--------|--------------|-------------|
+| `kill_process` | SIGTERM, then SIGKILL | refuses PID 0/1, itself, its own ancestors, and system daemons (systemd, sshd, …) |
+| `quarantine_file` | moves the file into a 0700 vault as `sha256`, chmod 000, manifest for `restore` | refuses symlinks, system trees (/usr, /etc, /bin…), >512 MB |
+| `block_ip` | `iptables` DROP in + out | refuses loopback/multicast/unspecified; `unblock` reverses it |
+
+Each (action, target) fires at most once per agent run, so a watch loop won't
+hammer the same containment. Rules opt in individually via the `response` key —
+auto-response never acts on rules that don't declare one.
+
 ## Running the tests
 
 ```bash
 pip install pytest httpx
-python -m pytest tests/ -v   # 74 tests (core + web security + multi-user auth)
+python -m pytest tests/ -v   # 97 tests (core + web security + multi-user + response)
 ```
 
 ## Deploying behind nginx (TLS termination)
@@ -175,7 +209,7 @@ HTML rendered by FastAPI — there is no JavaScript anywhere in the stack.
 - Binds to `127.0.0.1` by default; refuses non-loopback binds without `--allow-remote` (put it behind a TLS-terminating proxy for remote use)
 
 **Core hardening (applies to the CLI too)**
-- Alert log, IOC store, FIM baselines, and API token are written `0600` inside `0700` directories
+- Alert log, IOC store, FIM baselines, response log, and API token are written `0600` inside `0700` directories
 - Rule files: 5 MB size cap, 10k rule cap, strict schema validation
 
 ### API endpoints
@@ -197,12 +231,13 @@ aegis/
 ├── aegis/
 │   ├── agent.py              # orchestration, watch loop, dedup
 │   ├── alerts.py             # alert model, JSONL sink, reporting loader
-│   ├── cli.py                # scan / watch / fim / ioc / report / serve / user
+│   ├── cli.py                # scan / watch / fim / ioc / report / respond / serve / user
 │   ├── detection/engine.py   # rule matching + IOC store
 │   ├── monitors/
 │   │   ├── process.py        # process enumeration (incl. deleted-binary check)
 │   │   ├── network.py        # connection/listener snapshot
 │   │   └── fim.py            # SHA-256 baselines and diffing
+│   ├── response/actions.py   # active response: kill / quarantine / block + audit
 │   ├── rules/default_rules.json
 │   └── web/
 │       ├── auth.py           # Argon2id multi-user accounts + roles
@@ -216,9 +251,10 @@ aegis/
 ├── tests/test_aegis.py
 ├── tests/test_web.py
 ├── tests/test_users.py
+├── tests/test_response.py
 └── pyproject.toml
 ```
 
 ## Honest limitations vs. a real EDR
 
-Aegis demonstrates the *architecture* of an EDR, but production platforms add kernel-level telemetry (eBPF/ETW) instead of polling, a cloud backend for fleet-wide correlation, ML classifiers, memory scanning, and response actions (kill process, quarantine, isolate host). Natural next steps here: eBPF-based exec hooks, YARA integration, a central alert collector over HTTP, and containment actions.
+Aegis demonstrates the *architecture* of an EDR, but production platforms add kernel-level telemetry (eBPF/ETW) instead of polling, a cloud backend for fleet-wide correlation, ML classifiers, memory scanning, and full host isolation (Aegis blocks per-IP only). Natural next steps here: eBPF-based exec hooks, YARA integration, and a central alert collector over HTTP.
