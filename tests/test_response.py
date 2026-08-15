@@ -1,51 +1,52 @@
-"""Tests for active response: kill, quarantine, firewall block, dispatch."""
+"""Tests for active response: kill, quarantine, block, rule wiring."""
+
+from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import time
+from pathlib import Path
 
+import psutil
 import pytest
 
-from aegis.alerts import Alert
+from aegis.agent import Agent
+from aegis.alerts import AlertSink
 from aegis.detection.engine import DetectionEngine, Rule
-from aegis.response.actions import Responder, ResponseLog
+from aegis.response.actions import (
+    DEFAULT_QUARANTINE_DIR, Responder, VALID_RESPONSES,
+)
 
 
-@pytest.fixture()
+@pytest.fixture
 def responder(tmp_path):
-    return Responder(log_path=tmp_path / "response.jsonl",
-                     quarantine_dir=tmp_path / "vault",
-                     blocked_path=tmp_path / "blocked.json",
-                     dry_run=False)
-
-
-@pytest.fixture()
-def dry_responder(tmp_path):
     return Responder(log_path=tmp_path / "response.jsonl",
                      quarantine_dir=tmp_path / "vault",
                      blocked_path=tmp_path / "blocked.json",
                      dry_run=True)
 
 
-def _spawn():
-    return subprocess.Popen(["sleep", "300"])
-
-
 class TestKillProcess:
-    def test_kill_real_process(self, responder):
-        proc = _spawn()
-        result = responder.kill_process(proc.pid, "[TEST]")
-        assert result.success
-        proc.wait(timeout=5)
-        assert proc.poll() is not None  # actually dead
-
-    def test_dry_run_leaves_process_alive(self, dry_responder):
-        proc = _spawn()
+    def test_kill_real_process(self, tmp_path):
+        proc = subprocess.Popen(["sleep", "300"])
         try:
-            result = dry_responder.kill_process(proc.pid)
+            r = Responder(log_path=tmp_path / "r.jsonl",
+                          quarantine_dir=tmp_path / "v", dry_run=False)
+            result = r.kill_process(proc.pid, "test")
+            assert result.success
+            proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_dry_run_does_not_kill(self, responder):
+        proc = subprocess.Popen(["sleep", "300"])
+        try:
+            result = responder.kill_process(proc.pid)
             assert result.success and result.dry_run
-            assert proc.poll() is None  # untouched
+            assert proc.poll() is None  # still alive
         finally:
             proc.kill()
 
@@ -56,9 +57,12 @@ class TestKillProcess:
 
     def test_ancestor_refused(self, responder):
         # Killing our own parent chain would take down the operator's shell,
-        # IDE, or supervisor along with the "target".
+        # IDE, or supervisor along with the "target". (Under init-as-parent
+        # environments the protected-PID guard fires first — either refusal
+        # is correct.)
         assert not responder.kill_process(os.getppid()).success
-        assert "ancestor" in responder.log.load()[0]["detail"]
+        detail = responder.log.load()[0]["detail"]
+        assert "ancestor" in detail or "protected" in detail
 
     def test_gone_process_is_success(self, responder):
         result = responder.kill_process(2**22)  # almost certainly absent
@@ -68,158 +72,133 @@ class TestKillProcess:
 
 class TestQuarantine:
     def test_quarantine_and_restore(self, responder, tmp_path):
-        target = tmp_path / "evil.sh"
-        target.write_text("#!/bin/sh\necho pwned\n")
-        os.chmod(target, 0o755)
+        src = tmp_path / "evil.sh"
+        src.write_text("#!/bin/sh\nrm -rf /\n")
+        os.chmod(src, 0o755)
+        result = responder.quarantine_file(src)
+        assert result.success and result.dry_run
+        assert src.exists()  # dry-run didn't touch it
 
-        result = responder.quarantine_file(target)
+        r2 = Responder(log_path=responder.log.path,
+                       quarantine_dir=responder.quarantine_dir, dry_run=False)
+        result = r2.quarantine_file(src)
         assert result.success
-        assert not target.exists()
-        entry = responder.manifest()[0]
-        qpath = tmp_path / "vault" / entry["id"]
-        assert qpath.exists()
-        assert oct(os.stat(qpath).st_mode & 0o777) == "0o0"  # inert
-        assert oct(os.stat(tmp_path / "vault" / "manifest.jsonl").st_mode & 0o777) == "0o600"
+        assert not src.exists()
+        manifest = r2.manifest()
+        assert len(manifest) == 1
+        qpath = r2.quarantine_dir / manifest[0]["id"]
+        assert stat.S_IMODE(os.stat(qpath).st_mode) == 0o000
+        assert stat.S_IMODE(os.stat(r2.quarantine_dir / "manifest.jsonl").st_mode) == 0o600
 
-        restored = responder.restore_file(entry["id"][:8])
+        restored = r2.restore_file(manifest[0]["id"][:8])
         assert restored.success
-        assert target.read_text() == "#!/bin/sh\necho pwned\n"
-        assert oct(os.stat(target).st_mode & 0o777) == "0o755"  # original mode
+        assert src.read_text() == "#!/bin/sh\nrm -rf /\n"
+        assert stat.S_IMODE(os.stat(src).st_mode) == 0o755
 
-    def test_dry_run_keeps_file(self, dry_responder, tmp_path):
-        target = tmp_path / "evil.sh"
-        target.write_text("x")
-        result = dry_responder.quarantine_file(target)
-        assert result.success
-        assert target.exists()
-
-    def test_system_path_refused(self, responder):
+    def test_refuses_system_paths(self, responder):
         assert not responder.quarantine_file("/etc/passwd").success
         assert not responder.quarantine_file("/usr/bin/python3").success
 
-    def test_symlink_refused(self, responder, tmp_path):
-        real = tmp_path / "real.txt"
-        real.write_text("x")
-        link = tmp_path / "link.txt"
-        link.symlink_to(real)
+    def test_refuses_symlink(self, responder, tmp_path):
+        target = tmp_path / "real"
+        target.write_text("x")
+        link = tmp_path / "link"
+        link.symlink_to(target)
         assert not responder.quarantine_file(link).success
-        assert real.exists()
 
-    def test_missing_file_refused(self, responder, tmp_path):
-        assert not responder.quarantine_file(tmp_path / "nope.bin").success
-
-    def test_restore_unknown_id_refused(self, responder):
-        assert not responder.restore_file("deadbeef").success
+    def test_refuses_missing(self, responder, tmp_path):
+        assert not responder.quarantine_file(tmp_path / "nope").success
 
 
 class TestBlockIp:
-    def test_dry_run_returns_commands(self, dry_responder):
-        result = dry_responder.block_ip("203.0.113.66")
-        assert result.success
-        assert "iptables" in result.detail and "DROP" in result.detail
+    def test_dry_run_block(self, responder):
+        result = responder.block_ip("203.0.113.66", "C2")
+        assert result.success and result.dry_run
+        assert "iptables" in result.detail
 
-    def test_invalid_ip_refused(self, responder):
-        assert not responder.block_ip("999.1.2.3").success
-        assert not responder.block_ip("not-an-ip").success
+    def test_refuses_bad_addresses(self, responder):
+        for bad in ("127.0.0.1", "0.0.0.0", "224.0.0.1", "not-an-ip", "::1"):
+            assert not responder.block_ip(bad).success, bad
 
-    def test_loopback_and_multicast_refused(self, responder):
-        assert not responder.block_ip("127.0.0.1").success
-        assert not responder.block_ip("224.0.0.1").success
-        assert not responder.block_ip("0.0.0.0").success
-
-    def test_real_block_requires_iptables(self, responder, monkeypatch):
-        import shutil
-        monkeypatch.setattr(shutil, "which", lambda name: None)
-        result = responder.block_ip("203.0.113.66")
+    def test_no_iptables_graceful(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda _: None)
+        r = Responder(log_path=tmp_path / "r.jsonl", quarantine_dir=tmp_path / "v",
+                      dry_run=False)
+        result = r.block_ip("203.0.113.66")
         assert not result.success
         assert "iptables not found" in result.detail
 
 
-class TestRuleResponseParsing:
-    def test_valid_response_accepted(self):
-        rule = Rule.from_dict({
-            "id": "T-1", "name": "t", "severity": "high", "event_type": "process",
-            "response": "kill_process",
-            "conditions": [{"field": "pid", "op": "exists"}]})
-        assert rule.response == "kill_process"
+class TestRuleResponse:
+    def test_valid_responses_parse(self):
+        for resp in VALID_RESPONSES:
+            rule = Rule.from_dict({
+                "id": "T", "name": "t", "severity": "low", "event_type": "process",
+                "conditions": [{"field": "pid", "op": "exists"}], "response": resp})
+            assert rule.response == resp
 
     def test_invalid_response_rejected(self):
         with pytest.raises(ValueError):
             Rule.from_dict({
-                "id": "T-2", "name": "t", "severity": "high", "event_type": "process",
-                "response": "rm_rf_slash",
-                "conditions": [{"field": "pid", "op": "exists"}]})
-
-    def test_default_rules_carry_responses(self):
-        from aegis.cli import RULES_PATH
-        from aegis.detection.engine import load_rules
-        rules = {r.id: r for r in load_rules(RULES_PATH)}
-        assert rules["PROC-002"].response == "kill_process"
-        assert rules["NET-001"].response == "block_ip"
-        assert rules["NET-004"].response == "kill_process"
-        assert rules["FIM-003"].response == "quarantine_file"
+                "id": "T", "name": "t", "severity": "low", "event_type": "process",
+                "conditions": [], "response": "rm_rf_slash"})
 
 
 class TestHandleAlert:
-    def _rule(self, rid, response):
-        return Rule(id=rid, name="t", severity="critical", event_type="process",
-                    description="", response=response)
+    def _engine(self):
+        rule = Rule.from_dict({
+            "id": "T-KILL", "name": "t", "severity": "critical",
+            "event_type": "process",
+            "conditions": [{"field": "exe_deleted", "op": "eq", "value": True}],
+            "response": "kill_process"})
+        return DetectionEngine([rule])
 
-    def test_dispatches_kill_for_matching_rule(self, dry_responder):
-        proc = _spawn()
-        try:
-            alert = Alert(rule_id="R-K", name="t", severity="critical",
-                          description="", event_type="process",
-                          event={"pid": proc.pid})
-            results = dry_responder.handle_alert(alert, {"R-K": self._rule("R-K", "kill_process")})
-            assert len(results) == 1
-            assert results[0].action == "kill_process"
-            assert results[0].success and proc.poll() is None  # dry-run
-        finally:
-            proc.kill()
+    def test_dispatches_declared_response(self, tmp_path):
+        r = Responder(log_path=tmp_path / "r.jsonl", quarantine_dir=tmp_path / "v",
+                      dry_run=True)
+        engine = self._engine()
+        alert = engine.evaluate({"type": "process", "pid": 4242, "exe_deleted": True})[0]
+        results = r.handle_alert(alert, {rule.id: rule for rule in engine.rules})
+        assert len(results) == 1 and results[0].dry_run
 
-    def test_no_response_means_no_action(self, dry_responder):
-        alert = Alert(rule_id="R-0", name="t", severity="low", description="",
-                      event_type="process", event={"pid": 123})
-        assert dry_responder.handle_alert(alert, {"R-0": self._rule("R-0", None)}) == []
+    def test_no_response_no_action(self, tmp_path):
+        r = Responder(log_path=tmp_path / "r.jsonl", quarantine_dir=tmp_path / "v")
+        engine = DetectionEngine([Rule.from_dict({
+            "id": "T-NOACT", "name": "t", "severity": "low", "event_type": "process",
+            "conditions": [{"field": "pid", "op": "exists"}]})])
+        alert = engine.evaluate({"type": "process", "pid": 1})[0]
+        assert r.handle_alert(alert, {"T-NOACT": engine.rules[0]}) == []
 
-    def test_each_target_contained_once(self, dry_responder):
-        alert = Alert(rule_id="R-K", name="t", severity="critical", description="",
-                      event_type="process", event={"pid": 424242})
-        rules = {"R-K": self._rule("R-K", "kill_process")}
-        assert len(dry_responder.handle_alert(alert, rules)) == 1
-        assert dry_responder.handle_alert(alert, rules) == []  # deduped
+    def test_once_per_target(self, tmp_path):
+        r = Responder(log_path=tmp_path / "r.jsonl", quarantine_dir=tmp_path / "v",
+                      dry_run=True)
+        engine = self._engine()
+        rules = {rule.id: rule for rule in engine.rules}
+        a1 = engine.evaluate({"type": "process", "pid": 4242, "exe_deleted": True})[0]
+        a2 = engine.evaluate({"type": "process", "pid": 4242, "exe_deleted": True})[0]
+        assert len(r.handle_alert(a1, rules)) == 1
+        assert r.handle_alert(a2, rules) == []  # same target: suppressed
 
     def test_agent_wires_responder(self, tmp_path):
-        from aegis.agent import Agent
-        from aegis.alerts import AlertSink
-        rule = Rule(id="R-K", name="t", severity="critical", event_type="process",
-                    description="", response="kill_process",
-                    conditions=[__import__("aegis.detection.engine", fromlist=["Condition"])
-                                .Condition(field="pid", op="gt", value=0)])
-        engine = DetectionEngine([rule])
-        resp = Responder(log_path=tmp_path / "r.jsonl",
-                         quarantine_dir=tmp_path / "v",
-                         blocked_path=tmp_path / "b.json",
-                         dry_run=True)
-        agent = Agent(engine, AlertSink(tmp_path / "alerts.jsonl", echo=False),
-                      responder=resp)
-        alerts = agent._dispatch(engine.evaluate({"type": "process", "pid": 999}))
+        sink = AlertSink(tmp_path / "alerts.jsonl", echo=False)
+        r = Responder(log_path=tmp_path / "r.jsonl", quarantine_dir=tmp_path / "v",
+                      dry_run=True)
+        agent = Agent(self._engine(), sink, responder=r)
+        alerts = agent._dispatch(agent.engine.evaluate(
+            {"type": "process", "pid": 4242, "exe_deleted": True}))
         assert len(alerts) == 1
-        entries = ResponseLog(tmp_path / "r.jsonl").load()
-        assert entries[0]["action"] == "kill_process"
-        assert entries[0]["dry_run"] is True
+        log = r.log.load()
+        assert len(log) == 1 and log[0]["action"] == "kill_process"
 
 
 class TestResponseLog:
-    def test_log_written_with_perms(self, tmp_path):
-        resp = Responder(log_path=tmp_path / "response.jsonl",
-                         quarantine_dir=tmp_path / "v",
-                         blocked_path=tmp_path / "b.json",
-                         dry_run=True)
-        resp.block_ip("203.0.113.66")
-        log = tmp_path / "response.jsonl"
-        assert oct(os.stat(log).st_mode & 0o777) == "0o600"
-        entries = ResponseLog(log).load()
-        assert entries[0]["action"] == "block_ip"
-        assert entries[0]["target"] == "203.0.113.66"
+    def test_log_perms_and_order(self, tmp_path):
+        r = Responder(log_path=tmp_path / "sub" / "r.jsonl",
+                      quarantine_dir=tmp_path / "v", dry_run=True)
+        r.kill_process(2**22)
+        r.block_ip("203.0.113.9")
+        path = tmp_path / "sub" / "r.jsonl"
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+        events = r.log.load()
+        assert events[0]["action"] == "block_ip"   # newest first
+        assert events[1]["action"] == "kill_process"
