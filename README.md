@@ -20,8 +20,13 @@ A host-based Endpoint Detection & Response (EDR) tool in Python, modeled on how 
               └──────────┬──────────┘
                          ▼  alerts (low → critical)
               ┌─────────────────────┐
-              │  Alert pipeline     │  console + JSONL log,
-              │  ~/.aegis/alerts.*  │  session dedup, reporting
+              │  Alert pipeline     │  console + JSONL log, session dedup,
+              │  ~/.aegis/alerts.*  │  hash-chained + replicated seal ledger
+              └──────────┬──────────┘
+                         ▼
+              ┌─────────────────────┐
+              │  Analytics layer    │  cross-source incident correlation,
+              │  (aegis/analytics)  │  behavioral baselining, ATT&CK tactics
               └──────────┬──────────┘
                          ▼
               ┌─────────────────────┐
@@ -71,8 +76,15 @@ python -m aegis fim check /etc
 python -m aegis ioc add --ip 203.0.113.66
 python -m aegis ioc list
 
-# summarize the alert log
+# summarize the alert log (severity + ATT&CK tactic rollup)
 python -m aegis report --severity high
+
+# analytics: correlate alerts into incidents, verify ledger, baseline the host
+python -m aegis incidents --window 300
+python -m aegis alerts verify                 # tamper check: chain + replicas
+python -m aegis alerts recover                # rebuild a lost seal from replicas
+python -m aegis baseline learn --cycles 10    # learn the host's normal profile
+python -m aegis baseline check                # anomaly? exit code 2
 
 # active response: dry-run by default, --execute to act for real
 python -m aegis scan --auto-respond                  # show what WOULD be contained
@@ -136,11 +148,29 @@ Each (action, target) fires at most once per agent run, so a watch loop won't
 hammer the same containment. Rules opt in individually via the `response` key —
 auto-response never acts on rules that don't declare one.
 
+## Analytics layer
+
+Four capabilities inspired — **as architectural metaphor only** — by
+holographic/distributed information models (see the note at the bottom; no
+quantum claims are made or needed):
+
+| Inspiration | Feature | How it works |
+|-------------|---------|--------------|
+| Holographic storage — every fragment holds the whole | **Tamper-evident seal ledger** | Every alert is appended to a hash-chained log (`~/.aegis/sealed/`, 0600 in 0700) mirrored to two replicas. `alerts verify` detects edits, deletions, and reordering; `alerts recover` rebuilds a lost seal from the replicas |
+| Non-local correlation | **Incident correlation** | `incidents` fuses process/network/FIM alerts that share a PID, remote IP, or path within a time window into one incident with max severity and combined tactics — one intrusion reads as one story, not nine alerts |
+| Resonance against a stored pattern | **Behavioral baselining** | `baseline learn` profiles the host's normal process/network metrics; `baseline check` scores fresh samples with per-metric z-scores and raises `ANOM-001` when the host diverges — catching what no rule matches |
+| Ontology of states | **ATT&CK tactic taxonomy** | Technique IDs roll up to kill-chain-ordered tactics in `report` and incidents |
+
+**Honest ledger limitation:** the seal proves tampering by anyone who can't
+rewrite *all* copies consistently; a root attacker who rewrites every replica
+can still forge history. Forward-secure integrity requires shipping seals
+off-host (syslog-ng, immutable object storage) — noted as a next step.
+
 ## Running the tests
 
 ```bash
 pip install pytest httpx
-python -m pytest tests/ -v   # 97 tests (core + web security + multi-user + response)
+python -m pytest tests/ -v   # 126 tests (core + web + multi-user + response + analytics)
 ```
 
 ## Deploying behind nginx (TLS termination)
@@ -177,6 +207,44 @@ python -m aegis token show                            # print the JSON API token
 python -m aegis token rotate                          # new token, old one dies instantly
 ```
 
+## Project layout
+
+```
+aegis/
+├── aegis/
+│   ├── agent.py              # orchestration, watch loop, dedup
+│   ├── alerts.py             # alert model, JSONL sink (+ sealed ledger), reporting loader
+│   ├── analytics/
+│   │   ├── correlate.py      # cross-source incident correlation (entity union-find)
+│   │   ├── baseline.py       # behavioral baseline learning + z-score anomaly alerts
+│   │   ├── ledger.py         # hash-chained, replicated, tamper-evident alert seal
+│   │   └── taxonomy.py       # MITRE ATT&CK technique -> tactic rollup
+│   ├── cli.py                # scan / watch / fim / ioc / report / respond / incidents /
+│   │                         # alerts / baseline / serve / user / token
+│   ├── detection/engine.py   # rule matching + IOC store
+│   ├── monitors/
+│   │   ├── process.py        # process enumeration (incl. deleted-binary check)
+│   │   ├── network.py        # connection/listener snapshot
+│   │   └── fim.py            # SHA-256 baselines and diffing
+│   ├── response/actions.py   # active response: kill / quarantine / block + audit
+│   ├── rules/default_rules.json
+│   └── web/
+│       ├── auth.py           # Argon2id multi-user accounts + roles
+│       ├── audit.py          # audit trail (logins, user/IOC changes)
+│       ├── security.py       # token mgmt, rate limiter, lockout, headers
+│       ├── sessions.py       # server-side sessions + CSRF tokens
+│       ├── server.py         # FastAPI: server-rendered UI + JSON API
+│       ├── templates/        # login.html, console.html (Jinja2)
+│       └── static/style.css  # the only non-Python asset (styling, not code)
+├── deploy/nginx/             # TLS-terminating reverse proxy config + dev cert script
+├── tests/test_aegis.py
+├── tests/test_web.py
+├── tests/test_users.py
+├── tests/test_response.py
+├── tests/test_analytics.py
+└── pyproject.toml
+```
+
 ## Web console & API security — pure Python, zero JavaScript
 
 The web layer (`aegis serve`) is a fully server-rendered application: **every
@@ -209,7 +277,7 @@ HTML rendered by FastAPI — there is no JavaScript anywhere in the stack.
 - Binds to `127.0.0.1` by default; refuses non-loopback binds without `--allow-remote` (put it behind a TLS-terminating proxy for remote use)
 
 **Core hardening (applies to the CLI too)**
-- Alert log, IOC store, FIM baselines, response log, and API token are written `0600` inside `0700` directories
+- Alert log, IOC store, FIM baselines, and API token are written `0600` inside `0700` directories
 - Rule files: 5 MB size cap, 10k rule cap, strict schema validation
 
 ### API endpoints
@@ -224,37 +292,10 @@ HTML rendered by FastAPI — there is no JavaScript anywhere in the stack.
 | GET | `/api/stats` | severity counts + host |
 | GET/POST/DELETE | `/api/iocs` | manage the IOC feed |
 
-## Project layout
-
-```
-aegis/
-├── aegis/
-│   ├── agent.py              # orchestration, watch loop, dedup
-│   ├── alerts.py             # alert model, JSONL sink, reporting loader
-│   ├── cli.py                # scan / watch / fim / ioc / report / respond / serve / user
-│   ├── detection/engine.py   # rule matching + IOC store
-│   ├── monitors/
-│   │   ├── process.py        # process enumeration (incl. deleted-binary check)
-│   │   ├── network.py        # connection/listener snapshot
-│   │   └── fim.py            # SHA-256 baselines and diffing
-│   ├── response/actions.py   # active response: kill / quarantine / block + audit
-│   ├── rules/default_rules.json
-│   └── web/
-│       ├── auth.py           # Argon2id multi-user accounts + roles
-│       ├── audit.py          # audit trail (logins, user/IOC changes)
-│       ├── security.py       # token mgmt, rate limiter, lockout, headers
-│       ├── sessions.py       # server-side sessions + CSRF tokens
-│       ├── server.py         # FastAPI: server-rendered UI + JSON API
-│       ├── templates/        # login.html, console.html (Jinja2)
-│       └── static/style.css  # the only non-Python asset (styling, not code)
-├── deploy/nginx/             # TLS-terminating reverse proxy config + dev cert script
-├── tests/test_aegis.py
-├── tests/test_web.py
-├── tests/test_users.py
-├── tests/test_response.py
-└── pyproject.toml
-```
-
 ## Honest limitations vs. a real EDR
 
-Aegis demonstrates the *architecture* of an EDR, but production platforms add kernel-level telemetry (eBPF/ETW) instead of polling, a cloud backend for fleet-wide correlation, ML classifiers, memory scanning, and full host isolation (Aegis blocks per-IP only). Natural next steps here: eBPF-based exec hooks, YARA integration, and a central alert collector over HTTP.
+Aegis demonstrates the *architecture* of an EDR, but production platforms add kernel-level telemetry (eBPF/ETW) instead of polling, a cloud backend for fleet-wide correlation, ML classifiers, memory scanning, and full host isolation (Aegis blocks per-IP only). Natural next steps here: eBPF-based exec hooks, YARA integration, off-host seal shipping for forward-secure logs, and a central alert collector over HTTP.
+
+---
+
+*Provenance note: the analytics layer's design metaphors (distributed/holographic storage, non-local correlation, resonance matching, state ontology) were adapted from a consciousness-studies paper the author found interesting (Valverde et al., NeuroQuantology 2022). That paper's physics claims are scientifically contested and play **no** role in the implementation — every mechanism above is ordinary, verifiable software engineering.*
