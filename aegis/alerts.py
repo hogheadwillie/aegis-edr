@@ -60,9 +60,14 @@ class Alert:
 
 
 class AlertSink:
-    """Appends alerts to a JSONL log and echoes them to the console."""
+    """Appends alerts to a JSONL log and echoes them to the console.
 
-    def __init__(self, log_path: Path | str, echo: bool = True, min_severity: str = "low") -> None:
+    When `seal_dir` is given, every alert is additionally sealed into a
+    hash-chained, replicated ledger (analytics.ledger) for tamper evidence.
+    """
+
+    def __init__(self, log_path: Path | str, echo: bool = True, min_severity: str = "low",
+                 seal_dir: Path | str | None = None) -> None:
         self.log_path = Path(log_path)
         self.echo = echo
         self.min_rank = SEVERITY_RANK[min_severity]
@@ -72,13 +77,23 @@ class AlertSink:
             os.chmod(self.log_path.parent, 0o700)
         except OSError:
             pass
+        self._seal = None
+        if seal_dir is not None:
+            from .analytics.ledger import SealedLedger
+            seal_dir = Path(seal_dir)
+            self._seal = SealedLedger(
+                seal_dir / "alerts.seal.jsonl",
+                replicas=[seal_dir / "replica-a.seal.jsonl", seal_dir / "replica-b.seal.jsonl"])
 
     def emit(self, alert: Alert) -> None:
         if not self.log_path.exists():
             fd = os.open(str(self.log_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
+        record = alert.to_dict()
         with self.log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(alert.to_dict(), ensure_ascii=False) + "\n")
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if self._seal is not None:
+            self._seal.append(record)
         if self.echo and SEVERITY_RANK[alert.severity] >= self.min_rank:
             print(f"[{alert.timestamp}] {alert.one_line()}")
 
