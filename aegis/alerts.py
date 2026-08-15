@@ -99,12 +99,24 @@ class AlertSink:
 
 
 def load_alerts(log_path: Path | str) -> List[Alert]:
+    """Load the alert log, skipping corrupt/tampered lines instead of dying.
+
+    A single bad line must never make the entire log unreadable — that's both
+    a robustness property and a security one (an attacker who can append one
+    bad byte shouldn't be able to blind the reporting path).
+    """
     path = Path(log_path)
     if not path.exists():
         return []
     alerts = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
-        if line:
-            alerts.append(Alert.from_dict(json.loads(line)))
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+            if isinstance(record, dict):
+                alerts.append(Alert.from_dict(record))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue  # drop the corrupt line, keep the rest
     return alerts

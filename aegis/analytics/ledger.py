@@ -14,9 +14,11 @@ requires shipping seals off-host (see README).
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -32,7 +34,14 @@ def _digest(seq: int, prev: str, record: dict) -> str:
 
 
 class SealedLedger:
-    """Append-only hash-chained JSONL log with synchronous replicas."""
+    """Append-only hash-chained JSONL log with synchronous replicas.
+
+    Appends are serialized by a process-wide lock *and* an fcntl flock on the
+    primary file, so concurrent threads and concurrent processes can't break
+    the chain.
+    """
+
+    _lock = threading.Lock()
 
     def __init__(self, path: Path | str, replicas: Optional[List[Path | str]] = None) -> None:
         self.path = Path(path)
@@ -62,15 +71,28 @@ class SealedLedger:
 
     def append(self, record: dict) -> str:
         """Seal a record into the chain and all replicas. Returns the digest."""
-        seq = self._seq + 1
-        digest = _digest(seq, self._prev, record)
-        line = json.dumps({"seq": seq, "prev": self._prev, "digest": digest,
-                           "record": record}, ensure_ascii=False) + "\n"
-        for f in [self.path, *self.replicas]:
-            with f.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-        self._seq, self._prev = seq, digest
-        return digest
+        with self._lock:
+            # Take the kernel-level lock on the primary file so separate
+            # processes serialize too; re-read the tail in case another
+            # process appended while we waited.
+            with self.path.open("a+", encoding="utf-8") as fh:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    self._seq, self._prev = self._tail(self.path)
+                    seq = self._seq + 1
+                    digest = _digest(seq, self._prev, record)
+                    line = json.dumps({"seq": seq, "prev": self._prev, "digest": digest,
+                                       "record": record}, ensure_ascii=False) + "\n"
+                    fh.write(line)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                    for replica in self.replicas:
+                        with replica.open("a", encoding="utf-8") as rfh:
+                            rfh.write(line)
+                    self._seq, self._prev = seq, digest
+                    return digest
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     # -- verification --------------------------------------------------------
 
@@ -88,6 +110,8 @@ class SealedLedger:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 return False, f"line {lineno}: corrupt JSON"
+            if not isinstance(entry, dict):
+                return False, f"line {lineno}: entry is not an object"
             seq += 1
             if entry.get("seq") != seq:
                 return False, f"line {lineno}: sequence break (expected {seq})"

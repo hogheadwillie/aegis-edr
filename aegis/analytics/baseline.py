@@ -67,7 +67,12 @@ class Baseline:
             raise ValueError(f"need at least {MIN_SAMPLES} samples to learn a baseline")
         stats = {}
         for metric in METRICS:
-            values = [s.get(metric, 0.0) for s in samples]
+            values = []
+            for s in samples:
+                v = s.get(metric, 0.0)
+                if not isinstance(v, (int, float)) or not math.isfinite(v):
+                    raise ValueError(f"non-numeric sample value for {metric}: {v!r}")
+                values.append(float(v))
             mean = fmean(values)
             stdev = pstdev(values)
             # Floor the spread: a metric pinned at one value must still be
@@ -76,10 +81,21 @@ class Baseline:
         return cls(stats)
 
     def score(self, sample: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
-        """Return (max_z, per-metric z-scores) for a sample."""
+        """Return (max_z, per-metric z-scores) for a sample.
+
+        Only known metrics are scored; hostile extra keys in the sample are
+        ignored. Non-finite inputs are treated as maximally anomalous rather
+        than crashing.
+        """
         zscores = {}
         for metric, s in self.stats.items():
-            zscores[metric] = abs(sample.get(metric, 0.0) - s["mean"]) / s["stdev"]
+            if metric not in METRICS:
+                continue
+            value = sample.get(metric, 0.0)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                zscores[metric] = float("inf")
+                continue
+            zscores[metric] = abs(value - s["mean"]) / s["stdev"]
         return (max(zscores.values(), default=0.0), zscores)
 
     def to_dict(self) -> dict:
@@ -88,7 +104,25 @@ class Baseline:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Baseline":
-        return cls(stats=data.get("stats", {}))
+        if not isinstance(data, dict):
+            raise ValueError("baseline file must be a JSON object")
+        stats = data.get("stats", {})
+        if not isinstance(stats, dict):
+            raise ValueError("baseline 'stats' must be an object")
+        clean: Dict[str, Dict[str, float]] = {}
+        for metric, s in stats.items():
+            if metric not in METRICS:
+                continue  # drop unknown/hostile metric names
+            if not isinstance(s, dict):
+                raise ValueError(f"baseline stat {metric!r} must be an object")
+            mean, stdev = s.get("mean"), s.get("stdev")
+            if not isinstance(mean, (int, float)) or not math.isfinite(mean):
+                raise ValueError(f"baseline stat {metric!r}: bad mean {mean!r}")
+            if not isinstance(stdev, (int, float)) or not math.isfinite(stdev) or stdev <= 0:
+                raise ValueError(f"baseline stat {metric!r}: bad stdev {stdev!r}")
+            clean[metric] = {"mean": float(mean), "stdev": float(stdev),
+                             "n": int(s.get("n", 0))}
+        return cls(stats=clean)
 
 
 def save_baseline(baseline: Baseline, path: Path | str) -> None:

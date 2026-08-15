@@ -17,6 +17,38 @@ from typing import Any, Dict, Iterable, List, Optional
 from ..alerts import Alert, SEVERITIES
 from ..response.actions import VALID_RESPONSES
 
+# -- ReDoS defense -----------------------------------------------------------
+MAX_REGEX_LEN = 500
+# Patterns that historically explode: nested quantifiers like (a+)+, (x|x)*$…
+_DANGEROUS_REGEX = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)[+*?]")
+_REGEX_TIMEOUT = 1.0  # seconds; enforced via signal on Unix
+
+
+def _check_regex(pattern: str) -> None:
+    if len(pattern) > MAX_REGEX_LEN:
+        raise ValueError(f"regex too long ({len(pattern)} > {MAX_REGEX_LEN})")
+    if _DANGEROUS_REGEX.search(pattern):
+        raise ValueError("regex rejected: nested quantifiers (ReDoS risk)")
+    re.compile(pattern)  # syntax check
+
+
+def _timed_search(pattern: str, text: str) -> bool:
+    """re.search with a hard timeout so a bad pattern can't hang the agent."""
+    import signal
+
+    def _boom(signum, frame):
+        raise TimeoutError("regex evaluation exceeded time limit")
+
+    if hasattr(signal, "SIGALRM"):
+        old = signal.signal(signal.SIGALRM, _boom)
+        signal.setitimer(signal.ITIMER_REAL, _REGEX_TIMEOUT)
+        try:
+            return re.search(pattern, text, re.IGNORECASE) is not None
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
 
 @dataclass
 class Condition:
@@ -49,7 +81,7 @@ class Condition:
         if self.op == "endswith":
             return str(actual).lower().endswith(str(self.value).lower())
         if self.op == "regex":
-            return re.search(self.value, str(actual), re.IGNORECASE) is not None
+            return _timed_search(str(self.value), str(actual))
         if self.op == "in_ioc":          # value names an IOC category, e.g. "ip"
             return str(actual) in iocs.get(self.value, set())
         raise ValueError(f"unknown operator {self.op!r}")
@@ -70,21 +102,35 @@ class Rule:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Rule":
+        if not isinstance(data, dict):
+            raise ValueError("rule must be a JSON object")
         if data.get("severity") not in SEVERITIES:
             raise ValueError(f"rule {data.get('id')}: invalid severity")
-        conditions = [Condition(**c) for c in data.get("conditions", [])]
+        raw_conditions = data.get("conditions", [])
+        if not isinstance(raw_conditions, list):
+            raise ValueError(f"rule {data.get('id')}: conditions must be a list")
+        conditions = []
+        for c in raw_conditions:
+            if not isinstance(c, dict) or set(c) - {"field", "op", "value"}:
+                raise ValueError(f"rule {data.get('id')}: bad condition {c!r}")
+            if c.get("op") == "regex":
+                _check_regex(str(c.get("value", "")))
+            conditions.append(Condition(**c))
         logic = data.get("logic", "all")
         if logic not in ("all", "any"):
             raise ValueError(f"rule {data.get('id')}: logic must be 'all' or 'any'")
+        mitre = data.get("mitre", [])
+        if not isinstance(mitre, list) or not all(isinstance(t, str) for t in mitre):
+            raise ValueError(f"rule {data.get('id')}: mitre must be a list of strings")
         response = data.get("response")
         if response is not None and response not in VALID_RESPONSES:
             raise ValueError(
                 f"rule {data.get('id')}: response must be one of {VALID_RESPONSES}")
         return cls(
-            id=data["id"], name=data["name"], severity=data["severity"],
-            event_type=data["event_type"], description=data.get("description", ""),
+            id=str(data["id"]), name=str(data["name"]), severity=data["severity"],
+            event_type=str(data["event_type"]), description=str(data.get("description", "")),
             conditions=conditions, logic=logic,
-            mitre=data.get("mitre", []), enabled=data.get("enabled", True),
+            mitre=mitre, enabled=bool(data.get("enabled", True)),
             response=response,
         )
 
@@ -151,10 +197,27 @@ def load_rules(path: Path | str) -> List[Rule]:
     return rules
 
 
+MAX_IOC_FILE_BYTES = 5 * 1024 * 1024
+MAX_IOC_VALUES = 100_000
+
+
 def load_iocs(path: Path | str) -> Dict[str, set]:
     """Load the IOC store: {"ip": [...], "domain": [...], "sha256": [...]}."""
     path = Path(path)
     if not path.exists():
         return {"ip": set(), "domain": set(), "sha256": set()}
+    if path.stat().st_size > MAX_IOC_FILE_BYTES:
+        raise ValueError(f"IOC file {path} exceeds {MAX_IOC_FILE_BYTES} bytes")
     data = json.loads(path.read_text(encoding="utf-8"))
-    return {k: set(v) for k, v in data.items()}
+    if not isinstance(data, dict):
+        raise ValueError("IOC file must be a JSON object of category -> list")
+    iocs: Dict[str, set] = {}
+    total = 0
+    for category, values in data.items():
+        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+            raise ValueError(f"IOC category {category!r} must be a list of strings")
+        total += len(values)
+        if total > MAX_IOC_VALUES:
+            raise ValueError(f"too many IOC values ({total} > {MAX_IOC_VALUES})")
+        iocs[str(category)] = set(values)
+    return iocs
