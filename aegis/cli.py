@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -390,6 +391,7 @@ def _cmd_user(args) -> int:
 
 
 def _cmd_ioc(args) -> int:
+    import fcntl
     path = _ioc_path()
     if args.ioc_command == "list":
         iocs = load_iocs(path)
@@ -398,20 +400,30 @@ def _cmd_ioc(args) -> int:
             for v in sorted(values):
                 print(f"  {v}")
         return 0
-    iocs = load_iocs(path)
-    added = False
-    for category in ("ip", "domain", "sha256"):
-        value = getattr(args, category, None)
-        if value:
-            iocs.setdefault(category, set()).add(value.strip())
-            print(f"Added {category} IOC: {value}")
-            added = True
-    if not added:
+    values = {c: getattr(args, c, None) for c in ("ip", "domain", "sha256")}
+    if not any(values.values()):
         print("error: provide --ip, --domain, or --sha256", file=sys.stderr)
         return 1
+    # Read-modify-write under an exclusive flock so concurrent adds don't
+    # lose updates; write atomically via a temp file + rename.
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({k: sorted(v) for k, v in iocs.items()}, indent=2),
-                    encoding="utf-8")
+    lock_path = path.with_suffix(".lock")
+    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "w") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            iocs = load_iocs(path)
+            for category, value in values.items():
+                if value:
+                    iocs.setdefault(category, set()).add(value.strip())
+                    print(f"Added {category} IOC: {value}")
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({k: sorted(v) for k, v in iocs.items()}, indent=2),
+                           encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
     return 0
 
 
