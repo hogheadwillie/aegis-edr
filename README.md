@@ -126,7 +126,9 @@ Drop JSON files in a directory and pass `--rules DIR`:
 
 Operators: `eq`, `ne`, `gt`, `lt`, `in`, `contains`, `contains_any`, `startswith`,
 `endswith`, `regex`, `exists`, `in_ioc`. Combine conditions with
-`"logic": "all"` (default, AND) or `"any"` (OR).
+`"logic": "all"` (default, AND) or `"any"` (OR). Regex conditions are screened
+for catastrophic-backtracking shapes (nested quantifiers) at load and capped at
+1 s evaluation time at runtime — a hostile rule can't hang the agent.
 
 Add `"response": "kill_process" | "quarantine_file" | "block_ip"` to have the
 agent contain the threat when the rule fires (only with `--auto-respond`;
@@ -146,7 +148,10 @@ CrowdStrike-style containment, safe by default — **nothing executes without
 
 Each (action, target) fires at most once per agent run, so a watch loop won't
 hammer the same containment. Rules opt in individually via the `response` key —
-auto-response never acts on rules that don't declare one.
+auto-response never acts on rules that don't declare one. All responder inputs
+are scrubbed: IPs are sanitized to printable ASCII before parsing or logging,
+and quarantine restore ids must be hex SHA-256 prefixes — a crafted id can't
+traverse paths or crash the audit trail.
 
 ## Analytics layer
 
@@ -156,7 +161,7 @@ quantum claims are made or needed):
 
 | Inspiration | Feature | How it works |
 |-------------|---------|--------------|
-| Holographic storage — every fragment holds the whole | **Tamper-evident seal ledger** | Every alert is appended to a hash-chained log (`~/.aegis/sealed/`, 0600 in 0700) mirrored to two replicas. `alerts verify` detects edits, deletions, and reordering; `alerts recover` rebuilds a lost seal from the replicas |
+| Holographic storage — every fragment holds the whole | **Tamper-evident seal ledger** | Every alert is appended to a hash-chained log (`~/.aegis/sealed/`, 0600 in 0700) mirrored to two replicas. `alerts verify` detects edits, deletions, and reordering; `alerts recover` rebuilds a lost seal from the replicas. Appends are serialized by a thread lock + `fcntl.flock`, so concurrent threads/processes can't break the chain |
 | Non-local correlation | **Incident correlation** | `incidents` fuses process/network/FIM alerts that share a PID, remote IP, or path within a time window into one incident with max severity and combined tactics — one intrusion reads as one story, not nine alerts |
 | Resonance against a stored pattern | **Behavioral baselining** | `baseline learn` profiles the host's normal process/network metrics; `baseline check` scores fresh samples with per-metric z-scores and raises `ANOM-001` when the host diverges — catching what no rule matches |
 | Ontology of states | **ATT&CK tactic taxonomy** | Technique IDs roll up to kill-chain-ordered tactics in `report` and incidents |
@@ -170,8 +175,30 @@ off-host (syslog-ng, immutable object storage) — noted as a next step.
 
 ```bash
 pip install pytest httpx
-python -m pytest tests/ -v   # 126 tests (core + web + multi-user + response + analytics)
+python -m pytest tests/ -v   # 153 tests (core + web + multi-user + response + analytics + stress)
 ```
+
+The suite includes an **adversarial stress layer** (`tests/test_stress.py`)
+that attacks every input boundary — fuzzed rule files, malformed IOC stores,
+corrupt alert logs, ledger tampering/reordering/truncation, hostile baseline
+stats, manifest injection, 10k-alert correlation load, and 8-thread ×
+60-process concurrency races on the seal ledger and IOC store. Hardening that
+came out of it:
+
+- **ReDoS defense**: nested-quantifier regexes rejected at rule load; a 1 s
+  `setitimer` timeout caps any pattern that slips through at runtime
+- **Ledger concurrency**: process-wide lock + `fcntl.flock` on the primary
+  seal with tail re-read under the lock — 200 concurrent appends verify clean
+- **Corruption tolerance**: a single bad line in the alert log, quarantine
+  manifest, or seal never blinds the reader — good records survive
+- **Schema strictness**: rules reject non-dict items, unknown condition
+  fields, non-list `mitre`/`conditions`; IOC store capped at 100k values / 5 MB
+  and requires category→list-of-strings
+- **Input scrubbing**: `block_ip`/`unblock_ip`/`restore_file` sanitize to
+  printable ASCII (surrogates/NULs can't crash the audit write); quarantine
+  restore ids must be hex SHA-256 prefixes
+- **Atomic IOC writes**: read-modify-write under `flock` + temp-file rename —
+  no lost updates under a 60-process race
 
 ## Deploying behind nginx (TLS termination)
 
@@ -221,7 +248,7 @@ aegis/
 │   │   └── taxonomy.py       # MITRE ATT&CK technique -> tactic rollup
 │   ├── cli.py                # scan / watch / fim / ioc / report / respond / incidents /
 │   │                         # alerts / baseline / serve / user / token
-│   ├── detection/engine.py   # rule matching + IOC store
+│   ├── detection/engine.py   # rule matching + IOC store (ReDoS-guarded)
 │   ├── monitors/
 │   │   ├── process.py        # process enumeration (incl. deleted-binary check)
 │   │   ├── network.py        # connection/listener snapshot
@@ -242,6 +269,7 @@ aegis/
 ├── tests/test_users.py
 ├── tests/test_response.py
 ├── tests/test_analytics.py
+├── tests/test_stress.py
 └── pyproject.toml
 ```
 
