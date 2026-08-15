@@ -28,12 +28,21 @@ def _baseline_path(watch_dir: Path) -> Path:
     return AEGIS_HOME / "fim" / f"{key}.json"
 
 
+def _seal_dir() -> Path:
+    return AEGIS_HOME / "sealed"
+
+
+def _seal_paths() -> tuple:
+    d = _seal_dir()
+    return d / "alerts.seal.jsonl", [d / "replica-a.seal.jsonl", d / "replica-b.seal.jsonl"]
+
+
 def _build_agent(args) -> Agent:
     rules = load_rules(getattr(args, "rules", None) or RULES_PATH)
     iocs = load_iocs(_ioc_path())
     engine = DetectionEngine(rules, iocs, host=hostname())
     sink = AlertSink(AEGIS_HOME / "alerts.jsonl", echo=not getattr(args, "quiet", False),
-                     min_severity=getattr(args, "min_severity", "low"))
+                     min_severity=getattr(args, "min_severity", "low"), seal_dir=_seal_dir())
     responder = None
     if getattr(args, "auto_respond", False):
         from .response.actions import Responder
@@ -128,6 +137,25 @@ def build_parser() -> argparse.ArgumentParser:
     resp_sub.add_parser("blocked", help="list firewall-blocked IPs")
     resp_sub.add_parser("vault", help="list quarantined files")
     resp_sub.add_parser("log", help="show the response action log")
+
+    p_inc = sub.add_parser("incidents", help="correlate alerts into cross-source incidents")
+    p_inc.add_argument("--window", type=int, default=300,
+                       help="correlation window in seconds (default 300)")
+
+    p_al = sub.add_parser("alerts", help="tamper-evident alert ledger")
+    al_sub = p_al.add_subparsers(dest="alerts_command", required=True)
+    al_sub.add_parser("verify", help="verify the sealed ledger against the alert log")
+    al_sub.add_parser("recover", help="rebuild a lost/corrupt seal from its replicas")
+
+    p_bl = sub.add_parser("baseline", help="behavioral baseline anomaly detection")
+    bl_sub = p_bl.add_subparsers(dest="baseline_command", required=True)
+    p_bl_learn = bl_sub.add_parser("learn", help="sample the host and learn its normal profile")
+    p_bl_learn.add_argument("--cycles", type=int, default=5, help="samples to take (default 5)")
+    p_bl_learn.add_argument("--interval", type=float, default=2.0, help="seconds between samples")
+    p_bl_check = bl_sub.add_parser("check", help="score the host against the baseline")
+    p_bl_check.add_argument("--threshold", type=float, default=4.0,
+                            help="z-score that counts as anomalous (default 4.0)")
+    bl_sub.add_parser("show", help="print the learned baseline")
     return parser
 
 
@@ -139,6 +167,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "respond":
         return _cmd_respond(args)
+
+    if args.command == "incidents":
+        return _cmd_incidents(args)
+
+    if args.command == "alerts":
+        return _cmd_alerts(args)
+
+    if args.command == "baseline":
+        return _cmd_baseline(args)
 
     agent = _build_agent(args)
 
@@ -224,6 +261,85 @@ def _cmd_respond(args) -> int:
         return 0
     print(("DRY-RUN " if result.dry_run else "") + result.detail)
     return 0 if result.success else 1
+
+
+def _cmd_incidents(args) -> int:
+    from .analytics.correlate import correlate, save_incidents
+
+    alerts = load_alerts(AEGIS_HOME / "alerts.jsonl")
+    if not alerts:
+        print("No alerts recorded.")
+        return 0
+    incidents = correlate(alerts, window_seconds=args.window)
+    path = AEGIS_HOME / "incidents.jsonl"
+    save_incidents(incidents, path)
+    print(f"{len(incidents)} incident(s) from {len(alerts)} alert(s) -> {path}\n")
+    for inc in incidents:
+        print(inc.one_line())
+        if inc.tactics:
+            print(f"           tactics: {', '.join(inc.tactics)}  rules: {', '.join(inc.rule_ids)}")
+    return 2 if any(i.severity == "critical" for i in incidents) else 0
+
+
+def _cmd_alerts(args) -> int:
+    from .analytics.ledger import recover, verify_pair
+
+    seal, replicas = _seal_paths()
+    if args.alerts_command == "verify":
+        ok, detail = verify_pair(AEGIS_HOME / "alerts.jsonl", seal)
+        print(("OK  " if ok else "FAIL ") + detail)
+        return 0 if ok else 1
+    ok, detail = recover(seal, replicas)
+    print(("OK  " if ok else "FAIL ") + detail)
+    return 0 if ok else 1
+
+
+def _cmd_baseline(args) -> int:
+    from .analytics import baseline as bl
+
+    path = AEGIS_HOME / "baseline.json"
+    if args.baseline_command == "learn":
+        samples = []
+        for i in range(max(args.cycles, bl.MIN_SAMPLES)):
+            samples.append(bl.sample_metrics())
+            if i < args.cycles - 1:
+                import time
+                time.sleep(args.interval)
+        baseline = bl.Baseline.learn(samples)
+        bl.save_baseline(baseline, path)
+        print(f"Learned baseline from {len(samples)} sample(s) -> {path}")
+        for metric in bl.METRICS:
+            s = baseline.stats[metric]
+            print(f"  {metric:22} mean={s['mean']:.1f}  stdev={s['stdev']:.2f}")
+        return 0
+    if args.baseline_command == "show":
+        try:
+            baseline = bl.load_baseline(path)
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        for metric in bl.METRICS:
+            s = baseline.stats.get(metric)
+            if s:
+                print(f"  {metric:22} mean={s['mean']:.1f}  stdev={s['stdev']:.2f}  n={s['n']}")
+        return 0
+    # check
+    try:
+        baseline = bl.load_baseline(path)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    sample = bl.sample_metrics()
+    z, zscores = baseline.score(sample)
+    if z >= args.threshold:
+        alert = bl.anomaly_alert(z, zscores, host=hostname())
+        AlertSink(AEGIS_HOME / "alerts.jsonl", echo=False, seal_dir=_seal_dir()).emit(alert)
+        print(f"ANOMALY [{alert.severity.upper()}] max z={z:.1f} — logged to {AEGIS_HOME / 'alerts.jsonl'}")
+        for metric, value in sorted(zscores.items(), key=lambda kv: kv[1], reverse=True)[:3]:
+            print(f"  {metric:22} z={value:.1f}")
+        return 2
+    print(f"Host within baseline (max z={z:.1f} < {args.threshold}).")
+    return 0
 
 
 def _cmd_token(args) -> int:
@@ -314,6 +430,12 @@ def _cmd_report(args) -> int:
     for sev in ("critical", "high", "medium", "low"):
         if by_sev.get(sev):
             print(f"  {sev:8} {by_sev[sev]}")
+    from .analytics.taxonomy import tactic_summary
+    tactics = tactic_summary(alerts)
+    if tactics:
+        print("\nBy ATT&CK tactic:")
+        for tactic, count in tactics.most_common():
+            print(f"  {count:4}  {tactic}")
     print("\nTop detections:")
     for rule, count in by_rule.most_common(10):
         print(f"  {count:4}  {rule}")
